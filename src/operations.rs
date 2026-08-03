@@ -264,6 +264,18 @@ pub async fn doctor(config_path: &Path, offline: bool) -> Result<DoctorReport> {
                     "[warn] {name} listener is already occupied at {address}"
                 ));
             }
+            // Privileged ports commonly cannot be bound by the user running
+            // doctor, while the service itself gets CAP_NET_BIND_SERVICE from
+            // its systemd unit — expected, not a deployment problem.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && address.port() < 1024 =>
+            {
+                checks.push(format!(
+                    "[warn] cannot verify {name} listener at {address} as this user: \
+                     permission denied (the systemd unit grants CAP_NET_BIND_SERVICE)"
+                ));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => fail(
                 &mut checks,
                 &mut failures,
