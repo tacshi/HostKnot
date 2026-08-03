@@ -8,7 +8,29 @@ permissions:
   contents: write
 
 jobs:
+  # A broken tag must never ship binaries.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag matches Cargo.toml version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! grep -q "^version = \"${version}\"$" Cargo.toml; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version:" >&2
+            grep '^version' Cargo.toml >&2
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets
+
   linux-static:
+    needs: verify
     strategy:
       matrix:
         target:
@@ -48,6 +70,21 @@ jobs:
         run: cat artifacts/*.sha256 > artifacts/SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
+          generate_release_notes: true
+          body: |
+            Static Linux binaries for `x86_64` and `aarch64` (musl, no runtime dependencies).
+
+            **Install**
+
+            ```sh
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/hostknot-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/SHA256SUMS
+            sha256sum --check --ignore-missing SHA256SUMS
+            tar -xzf hostknot-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz
+            sudo ./hostknot service install --public-ip <YOUR-PUBLIC-IP> --binary ./hostknot
+            ```
+
+            Then follow the [quick start](https://github.com/${{ github.repository }}#quick-start).
           files: |
             artifacts/*.tar.gz
             artifacts/SHA256SUMS
