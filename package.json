@@ -1,0 +1,12 @@
+{
+  "name": "hostknot-browser-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "pretest:browser": "cargo build --quiet --example browser_fixture",
+    "test:browser": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1"
+  }
+}

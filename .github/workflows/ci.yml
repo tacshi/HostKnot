@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets
+      - run: cargo build --release
+
+  cross-build:
+    # Catch cross-target breaks on PRs instead of at release-tag time.
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo install cross --locked
+      - run: cross build --release --target "${{ matrix.target }}"
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --example browser_fixture
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser
+
+  pebble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start Pebble
+        run: |
+          # Pinned: the test depends on this image's pebble-config.json HTTP
+          # port (5002) and on IP-identifier/profile support.
+          docker run --detach --name hostknot-pebble --network host \
+            --env PEBBLE_VA_NOSLEEP=1 --env PEBBLE_WFE_NONCEREJECT=0 \
+            ghcr.io/letsencrypt/pebble:2.7.0
+          docker cp hostknot-pebble:/test/certs/pebble.minica.pem /tmp/pebble.minica.pem
+          for attempt in $(seq 1 30); do
+            if curl --silent --fail --insecure https://localhost:14000/dir >/dev/null; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+      - name: Test ACME issuance and persistence
+        env:
+          HOSTKNOT_PEBBLE_DIRECTORY: https://localhost:14000/dir
+          HOSTKNOT_PEBBLE_MANAGEMENT: https://localhost:15000
+          HOSTKNOT_PEBBLE_ROOT: /tmp/pebble.minica.pem
+          HOSTKNOT_PEBBLE_HTTP_LISTEN: 0.0.0.0:5002
+        run: cargo test --test acme_pebble -- --ignored
+      - if: always()
+        run: docker rm --force hostknot-pebble

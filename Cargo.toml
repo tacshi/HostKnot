@@ -2,5 +2,61 @@
 name = "hostknot"
 version = "0.1.0"
 edition = "2024"
+description = "Self-hosted domain binding and reverse proxy for a VPS"
+license = "MIT"
 
 [dependencies]
+anyhow = "1"
+argon2 = "0.5"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["form", "http1", "http2", "json", "macros", "tokio", "ws"] }
+base64 = "0.22"
+bytes = "1"
+chacha20poly1305 = "0.10"
+clap = { version = "4.5", features = ["derive", "env"] }
+futures-util = "0.3"
+get_if_addrs = "0.5"
+hex = "0.4"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "native-tokio", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "server", "service", "tokio"] }
+idna = "1"
+instant-acme = { version = "0.8", features = ["time", "x509-parser"] }
+rand = "0.9"
+rcgen = { version = "0.14", features = ["aws_lc_rs", "pem", "x509-parser"] }
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "http2", "json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.37", features = ["bundled", "chrono", "uuid"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+toml = "0.9"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["catch-panic", "request-id", "set-header", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+zeroize = "1"
+x509-parser = "0.18"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
