@@ -81,7 +81,7 @@ jobs:
             curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/SHA256SUMS
             sha256sum --check --ignore-missing SHA256SUMS
             tar -xzf hostknot-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz
-            sudo ./hostknot service install --public-ip <YOUR-PUBLIC-IP> --binary ./hostknot
+            sudo ./hostknot service install --public-ip <YOUR_VPS_IP> --binary ./hostknot
             ```
 
             Then follow the [quick start](https://github.com/${{ github.repository }}#quick-start).

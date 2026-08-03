@@ -34,7 +34,13 @@ Visitors ─▶ https://app.example.com ──▶ Hostknot :443 ──▶ 127.0.
 **1. Install.** Download the release archive for your architecture (`x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`), verify it against `SHA256SUMS`, then as root:
 
 ```sh
-hostknot service install --public-ip 203.0.113.10
+hostknot service install --public-ip <YOUR_VPS_IP>
+```
+
+`<YOUR_VPS_IP>` is the public IPv4 or IPv6 address the internet reaches your VPS on — it's published in DNS records and receives the admin UI's IP certificate. Unsure which it is? On the VPS:
+
+```sh
+curl -4 ifconfig.me
 ```
 
 ```sh
@@ -47,7 +53,7 @@ systemctl daemon-reload && systemctl enable --now hostknot
 journalctl -u hostknot | grep 'setup URL'
 ```
 
-It looks like `https://203.0.113.10:9443/setup?token=...`. The token is single-use and expires after one hour — restart the service or run `hostknot admin reset` for a fresh one. Before the URL appears, Hostknot obtains a trusted Let's Encrypt IP certificate over HTTP-01, so port 80 must already be reachable; if issuance fails, the UI still comes up on a self-signed fallback and keeps retrying.
+It looks like `https://<YOUR_VPS_IP>:9443/setup?token=...`. The token is single-use and expires after one hour — restart the service or run `hostknot admin reset` for a fresh one. Before the URL appears, Hostknot obtains a trusted Let's Encrypt IP certificate over HTTP-01, so port 80 must already be reachable; if issuance fails, the UI still comes up on a self-signed fallback and keeps retrying.
 
 **3. Create the administrator.** Open the URL, set an admin password (12+ characters) and an ACME contact email.
 
