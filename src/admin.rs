@@ -764,24 +764,25 @@ fn discover_listening_ports() -> Vec<u16> {
         };
         for line in contents.lines().skip(1) {
             let columns: Vec<_> = line.split_whitespace().collect();
-            if columns.len() > 3 && columns[3] == "0A" {
-                if let Some((address, port)) = columns[1].split_once(':') {
-                    // Only offer sockets the proxy can actually reach: it
-                    // connects to 127.0.0.1, so a listener bound solely to a
-                    // public interface would always 502.
-                    let reachable_via_loopback = matches!(
-                        address,
-                        "0100007F"                                  // 127.0.0.1
-                            | "00000000"                            // 0.0.0.0
-                            | "00000000000000000000000001000000"    // ::1
-                            | "00000000000000000000000000000000" // ::
-                    );
-                    if !reachable_via_loopback {
-                        continue;
-                    }
-                    if let Ok(port) = u16::from_str_radix(port, 16) {
-                        ports.push(port);
-                    }
+            if columns.len() > 3
+                && columns[3] == "0A"
+                && let Some((address, port)) = columns[1].split_once(':')
+            {
+                // Only offer sockets the proxy can actually reach: it
+                // connects to 127.0.0.1, so a listener bound solely to a
+                // public interface would always 502.
+                let reachable_via_loopback = matches!(
+                    address,
+                    "0100007F"                                  // 127.0.0.1
+                        | "00000000"                            // 0.0.0.0
+                        | "00000000000000000000000001000000"    // ::1
+                        | "00000000000000000000000000000000" // ::
+                );
+                if !reachable_via_loopback {
+                    continue;
+                }
+                if let Ok(port) = u16::from_str_radix(port, 16) {
+                    ports.push(port);
                 }
             }
         }
