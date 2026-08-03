@@ -16,7 +16,7 @@ jobs:
           - aarch64-unknown-linux-musl
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install cross
@@ -29,7 +29,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/hostknot" dist/hostknot
           tar -C dist -czf "hostknot-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" hostknot
           sha256sum "hostknot-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" > "hostknot-${{ github.ref_name }}-${{ matrix.target }}.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: |
@@ -40,7 +40,7 @@ jobs:
     needs: linux-static
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
