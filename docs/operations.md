@@ -29,7 +29,7 @@ Install the same or a newer Hostknot binary, stop the service, restore `config.t
 1. Back up the state unit described above.
 2. Verify the new binary checksum.
 3. Run `hostknot service install --public-ip <current-IP> --binary ./hostknot`.
-4. Restart the service and run `hostknot doctor`.
+4. Restart the service, then confirm the upgrade took effect with `hostknot version` and run `hostknot doctor`.
 
 Schema migrations are transactional and forward-only. Do not start an older Hostknot binary against a database already opened by a newer major/minor release unless its release notes explicitly permit downgrade.
 

@@ -89,7 +89,7 @@ Defaults: `--config /etc/hostknot/config.toml`, `--state-dir /var/lib/hostknot`.
 
 ## Configuration
 
-The installer writes `/etc/hostknot/config.toml`; most deployments never need to touch it.
+The installer writes `/etc/hostknot/config.toml` **on first install only** — re-running `service install` upgrades the binary and unit but never rewrites an existing config (it warns if `--public-ip` differs from what the config already says). Most deployments never need to touch it.
 
 | Key | Default | Description |
 |---|---|---|
@@ -101,6 +101,20 @@ The installer writes `/etc/hostknot/config.toml`; most deployments never need to
 | `drain_seconds` | `300` | How long a route keeps serving after its DNS records are removed |
 | `acme_directory_url` | Let's Encrypt production | ACME directory (point at a staging/test CA if needed) |
 | `acme_root_certificate` | *(unset)* | Extra root to trust for the ACME directory (test CAs) |
+
+### Upgrading
+
+Run the new binary's installer against the live service, then restart and confirm the version actually changed:
+
+```sh
+sudo ./hostknot service install --public-ip <YOUR_VPS_IP> --binary ./hostknot && sudo systemctl restart hostknot && hostknot version
+```
+
+Bindings, credentials, and certificates are preserved — upgrades only swap the binary (staged and renamed atomically, so a running service is safe to upgrade in place).
+
+### Changing the public IP
+
+Reinstalls never touch an existing config, so a changed VPS address is a manual edit: update `public_ips` and `admin_public_url` in `/etc/hostknot/config.toml`, restart, and expect the admin certificate and DNS records to be re-issued for the new address on the next reconciliation.
 
 ### Files on disk
 
@@ -123,6 +137,12 @@ hostknot doctor --config /etc/hostknot/config.toml
 ```
 
 The admin dashboard shows per-binding DNS/certificate/upstream status and an event history. [docs/operations.md](docs/operations.md) covers failure behavior, backup/restore, and upgrades.
+
+Common gotchas:
+
+- **An upgrade "didn't take"** — run `hostknot version`; if it still shows the old version, the install step failed before the restart (its error is easy to miss in a `&&` chain). Re-run the installer and check its output.
+- **Admin forms rejected, DNS records or the admin certificate using a wrong address** — the config still holds the IP from the *first* install; see "Changing the public IP" above.
+- **A binding 502s immediately** — check the upstream protocol on the binding: an HTTPS upstream setting against an app that speaks plain HTTP fails the TLS handshake. Most local apps want HTTP.
 
 ## Development
 
