@@ -32,6 +32,13 @@ test("connect Cloudflare, bind, confirm replacement, and unbind", async ({ page 
     "https://dash.cloudflare.com/?to=%2F%3Aaccount%2Foauth-clients"
   );
   await expect(createOAuthClient).toHaveAttribute("target", "_blank");
+  await expect(page.getByText("Code", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Authorization Code + Refresh Token", { exact: true })
+  ).toBeVisible();
+  await expect(
+    page.getByText("Client Secret Basic", { exact: true })
+  ).toBeVisible();
   await page.getByLabel("Client ID").fill("private-client-id");
   await page.getByLabel("Client secret").fill("private-client-secret");
   await page.getByRole("button", { name: "Save OAuth client" }).click();
@@ -39,6 +46,8 @@ test("connect Cloudflare, bind, confirm replacement, and unbind", async ({ page 
   // Submit a clean hostname to the live loopback upstream, follow the OAuth
   // round trip, then let reconciliation finish the pending binding.
   await page.goto(`${fixture.baseUrl}/bindings/new`);
+  await expect(page.getByLabel("Upstream protocol")).toHaveValue("https");
+  await page.getByLabel("Upstream protocol").selectOption("http");
   await page.getByLabel("Hostname").fill("app.example.com");
   await page.getByLabel("Local port").fill(String(fixture.upstreamPort));
   await page.getByRole("button", { name: "Bind domain" }).click();
@@ -52,8 +61,16 @@ test("connect Cloudflare, bind, confirm replacement, and unbind", async ({ page 
     await expect(appRow.locator(".pill.active")).toBeVisible();
   }).toPass({ timeout: 15_000 });
 
-  // The table must stay readable at the tablet-sized viewport from the
-  // reported UI: an upstream address is one unit and must not split mid-IP.
+  // At the reported 1024px viewport, six table columns are too cramped. Use
+  // the labeled card layout before status and certificate copy starts wrapping.
+  await page.setViewportSize({ width: 1024, height: 900 });
+  await expect(appRow).toHaveCSS("display", "grid");
+  await expect(appRow.locator("td").last()).toHaveCSS(
+    "border-bottom-width",
+    "0px"
+  );
+
+  // An upstream address is one unit and must not split mid-IP.
   await page.setViewportSize({ width: 810, height: 900 });
   const upstreamLines = await appRow.locator("code").evaluate(element => {
     const range = document.createRange();
@@ -65,6 +82,7 @@ test("connect Cloudflare, bind, confirm replacement, and unbind", async ({ page 
   // A hostname with pre-existing records goes through the confirmation
   // interstitial before anything is replaced.
   await page.goto(`${fixture.baseUrl}/bindings/new`);
+  await page.getByLabel("Upstream protocol").selectOption("http");
   await page.getByLabel("Hostname").fill("conflict.example.com");
   await page.getByLabel("Local port").fill(String(fixture.upstreamPort));
   await page.getByRole("button", { name: "Bind domain" }).click();
@@ -84,12 +102,7 @@ test("connect Cloudflare, bind, confirm replacement, and unbind", async ({ page 
   await expect(appRow.getByRole("link", { name: "Edit" })).toHaveCount(0);
   await expect(appRow.getByRole("button", { name: "Unbind" })).toHaveCount(0);
   await expect(appRow.getByText("Removal in progress")).toBeVisible();
-  await expect(async () => {
-    await page.goto(fixture.baseUrl);
-    await expect(
-      page.locator("tr[data-binding-id]").filter({ hasText: "app.example.com" })
-    ).toHaveCount(0);
-  }).toPass({ timeout: 15_000 });
+  await expect(appRow).toHaveCount(0, { timeout: 15_000 });
   await expect(
     page
       .locator("tr[data-binding-id]")

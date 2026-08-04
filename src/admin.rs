@@ -128,6 +128,20 @@ async fn index(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Resp
         return Redirect::to("/login").into_response();
     };
     let bindings = state.bindings.list().unwrap_or_default();
+    let refresh_after = bindings
+        .iter()
+        .any(|binding| binding.status == "draining")
+        .then(|| state.store.draining_bindings().unwrap_or_default())
+        .and_then(|draining| draining.into_iter().map(|(_, _, deadline)| deadline).min())
+        .map(|deadline| {
+            deadline
+                .saturating_sub(state.clock.now())
+                .max(0)
+                .saturating_add(1)
+        });
+    let refresh = refresh_after
+        .map(|seconds| format!(r#"<meta http-equiv="refresh" content="{seconds}">"#))
+        .unwrap_or_default();
     let content = if bindings.is_empty() {
         r#"<section class="empty"><h2>No bindings yet</h2><p>Connect a DNS provider, then bind a hostname to a local port.</p></section>"#.to_owned()
     } else {
@@ -205,8 +219,9 @@ async fn index(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Resp
         .collect::<String>();
     let history =
         format!("<section class=\"events\"><h2>Event history</h2><ol>{events}</ol></section>");
-    Html(page(
+    Html(page_with_head(
         "Hostknot",
+        &refresh,
         &format!(r#"<main><header><div><span class="eyebrow">HOSTKNOT</span><h1>Domain bindings</h1></div><nav><a href="/providers/cloudflare">Cloudflare</a><a class="button" href="/bindings/new">New binding</a><form class="inline" method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button type="submit">Sign out</button></form></nav></header>{content}{history}</main>"#, escape_html(&csrf)),
     ))
     .into_response()
@@ -344,7 +359,7 @@ async fn cloudflare_page(State(state): State<Arc<AdminState>>, headers: HeaderMa
     Html(page(
         "Cloudflare",
         &format!(
-            r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">DNS PROVIDER</span><h1>Cloudflare</h1>{status}{setup_action}<section class="instructions"><h2>OAuth client settings</h2><p>Grant Zone Read, DNS Write, and offline access. Register this exact callback:</p><code>{callback}</code></section><form method="post" action="/providers/cloudflare/configure"><input type="hidden" name="csrf" value="{}"><label>Client ID<input name="client_id" required></label><label>Client secret<input name="client_secret" type="password" autocomplete="off" required></label><label>Scopes<input name="scopes" value="zone.read dns.write offline_access" required></label><button type="submit">Save OAuth client</button></form></main>"#,
+            r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">DNS PROVIDER</span><h1>Cloudflare</h1>{status}{setup_action}<section class="instructions"><span class="step-label">STEP 1 · CLOUDFLARE</span><h2>Use these OAuth settings</h2><p>Enter these values on Cloudflare's <strong>Configure OAuth client</strong> screen.</p><dl class="oauth-settings"><div><dt>Client name</dt><dd>Hostknot</dd></div><div><dt>Response type</dt><dd>Code</dd></div><div><dt>Grant types</dt><dd>Authorization Code + Refresh Token</dd></div><div><dt>Token authentication</dt><dd>Client Secret Basic</dd></div><div class="wide"><dt>Redirect (Callback) URL</dt><dd><code>{callback}</code></dd></div></dl><p><strong>After Continue:</strong> select <strong>Zone · Read</strong> and <strong>DNS · Write</strong>. Leave Client URL blank and Advanced options unchanged.</p></section><form method="post" action="/providers/cloudflare/configure"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="scopes" value="zone.read dns.write offline_access"><span class="step-label">STEP 2 · HOSTKNOT</span><h2>Paste the generated credentials</h2><p>Cloudflare shows the client secret once. Copy both values before leaving the page.</p><label>Client ID<input name="client_id" required></label><label>Client secret<input name="client_secret" type="password" autocomplete="off" required></label><button type="submit">Save OAuth client</button></form></main>"#,
             escape_html(&csrf)
         ),
     ))
@@ -506,7 +521,7 @@ async fn new_binding_page(State(state): State<Arc<AdminState>>, headers: HeaderM
     Html(page(
         "New binding",
         &format!(
-            r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">NEW ROUTE</span><h1>Bind a domain</h1><form method="post" action="/bindings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="replace_existing" value="false"><label>Hostname<input name="hostname" placeholder="app.example.com" required></label><label>Upstream protocol<select name="upstream_scheme"><option value="http">HTTP</option><option value="https">HTTPS</option></select></label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" list="ports" required><datalist id="ports">{ports}</datalist></label><label class="check"><input name="proxied" type="checkbox" value="true" checked> Enable Cloudflare proxy</label><label class="check"><input name="insecure_tls" type="checkbox" value="true"> Allow an untrusted HTTPS upstream certificate</label><button type="submit">Bind domain</button></form></main>"#,
+            r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">NEW ROUTE</span><h1>Bind a domain</h1><form method="post" action="/bindings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="replace_existing" value="false"><label>Hostname<input name="hostname" placeholder="app.example.com" required></label><label>Upstream protocol<select name="upstream_scheme"><option value="https" selected>HTTPS</option><option value="http">HTTP</option></select></label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" list="ports" required><datalist id="ports">{ports}</datalist></label><label class="check"><input name="proxied" type="checkbox" value="true" checked> Enable Cloudflare proxy</label><label class="check"><input name="insecure_tls" type="checkbox" value="true"> Allow an untrusted HTTPS upstream certificate</label><button type="submit">Bind domain</button></form></main>"#,
             escape_html(&csrf)
         ),
     ))
@@ -932,6 +947,13 @@ form,.empty,.instructions,.status,.table,.events{margin-top:2rem;padding:28px;bo
 .status{display:flex;justify-content:space-between;gap:18px}
 .status span,small,.muted{display:block;color:var(--muted)}
 .provider-actions{margin:1rem 0 0}
+.step-label{display:block;margin-bottom:8px;color:var(--accent);font-size:.7rem;font-weight:800;letter-spacing:.14em}
+.oauth-settings{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;margin:20px 0;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--line)}
+.oauth-settings>div{min-width:0;padding:14px 16px;background:#0d100e}
+.oauth-settings .wide{grid-column:1/-1}
+.oauth-settings dt{color:var(--muted);font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em}
+.oauth-settings dd{margin:5px 0 0;color:var(--ink);font-weight:700}
+.oauth-settings code{display:block;overflow-x:auto;overflow-wrap:normal;white-space:nowrap;padding:0;background:none;font-size:.875rem;font-weight:500}
 label{display:block;color:var(--muted);font-size:.875rem;margin-bottom:20px}
 input,select{width:100%;margin-top:7px;border:1px solid var(--line);border-radius:10px;background:#0d100e;color:var(--ink);font:inherit;padding:12px 14px;outline:none}
 .check{display:flex;align-items:center;gap:10px}
@@ -949,8 +971,7 @@ th{color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.
 .actions .inline{margin-top:10px}
 .pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:3px 10px}
 .pill.active{border-color:#65d68b;color:var(--accent)}
-@media(max-width:900px){
-  header{align-items:flex-start;flex-direction:column}
+@media(max-width:1100px){
   .table table,.table tbody{display:block}
   .table thead{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
   .table tr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;padding:22px 0;border-bottom:1px solid var(--line)}
@@ -961,9 +982,14 @@ th{color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.
   .table .actions{grid-column:1/-1;white-space:normal}
   .table .actions .inline{display:inline-block;margin:0 0 0 12px}
 }
+@media(max-width:900px){
+  header{align-items:flex-start;flex-direction:column}
+}
 @media(max-width:500px){
   main{padding:40px 18px}
   form,.empty,.instructions,.status,.table,.events{padding:20px}
+  .oauth-settings{grid-template-columns:1fr}
+  .oauth-settings .wide{grid-column:auto}
   .table tr{grid-template-columns:1fr}
   .table .actions{grid-column:auto}
 }
