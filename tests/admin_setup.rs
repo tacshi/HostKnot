@@ -340,7 +340,7 @@ async fn time_based_expiries_are_enforced() {
         .unwrap();
     assert_eq!(own_port.status(), StatusCode::BAD_REQUEST);
     let body = own_port.text().await.unwrap();
-    assert!(body.contains("Hostknot's own listeners"));
+    assert!(body.contains("own listeners"));
     assert!(body.contains("admin UI"));
 
     // Sessions expire after twelve hours.

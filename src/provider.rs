@@ -166,17 +166,21 @@ impl DnsProvider for InMemoryDnsProvider {
 
     async fn revert(&self, receipt: &DnsReceipt) -> anyhow::Result<()> {
         let mut records = self.records.lock().unwrap();
+        // Mirror the production adapter: absence is already-reverted, only a
+        // modified record is drift.
         for expected in &receipt.created {
-            if !records.iter().any(|record| {
-                record.id == expected.id
-                    && record.content == expected.content
-                    && record.proxied == expected.proxied
-            }) {
+            if let Some(record) = records.iter().find(|record| record.id == expected.id)
+                && (record.content != expected.content || record.proxied != expected.proxied)
+            {
                 return Err(DnsError::Drift.into());
             }
         }
         records.retain(|record| !receipt.created.iter().any(|item| item.id == record.id));
-        records.extend(receipt.replaced.clone());
+        for replaced in &receipt.replaced {
+            if !records.iter().any(|record| record.id == replaced.id) {
+                records.push(replaced.clone());
+            }
+        }
         Ok(())
     }
 }

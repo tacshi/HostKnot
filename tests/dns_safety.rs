@@ -121,6 +121,135 @@ async fn conflicting_dns_requires_confirmation_and_is_restored_on_unbind() {
     provider_task.abort();
 }
 
+#[tokio::test]
+async fn unbind_is_idempotent_and_tolerates_already_deleted_records() {
+    let dns = FakeDns {
+        records: Arc::new(Mutex::new(Vec::new())),
+    };
+    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_addr = provider_listener.local_addr().unwrap();
+    let provider = fake_provider_router(dns.clone());
+    let provider_task = tokio::spawn(async move {
+        axum::serve(provider_listener, provider).await.unwrap();
+    });
+
+    let state = TempDir::new().unwrap();
+    let config = Config::for_test(state.path(), "127.0.0.1:0".parse().unwrap())
+        .with_public_ips(vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))])
+        .with_drain_duration(Duration::from_secs(30))
+        .with_cloudflare_endpoints(CloudflareEndpoints {
+            authorization: Url::parse(&format!("http://{provider_addr}/oauth2/auth")).unwrap(),
+            token: Url::parse(&format!("http://{provider_addr}/oauth2/token")).unwrap(),
+            api: Url::parse(&format!("http://{provider_addr}/client/v4/")).unwrap(),
+        });
+    let running = Hostknot::start(config).await.unwrap();
+    let base = format!("http://{}", running.admin_addr());
+    let browser = Client::builder()
+        .redirect(Policy::none())
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    initialize_and_connect(&browser, &base, running.bootstrap_token().unwrap()).await;
+    let csrf = binding_csrf(&browser, &base).await;
+    assert_eq!(
+        create_binding(&browser, &base, &csrf, false).await.status(),
+        StatusCode::SEE_OTHER
+    );
+    let dashboard = browser
+        .get(&base)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let binding_id = data_value(&dashboard, "binding-id");
+    let remove_csrf = hidden_value(&dashboard, "csrf");
+
+    // First unbind deletes the records and starts the drain.
+    let first = browser
+        .post(format!("{base}/bindings/{binding_id}/remove"))
+        .form(&[("csrf", remove_csrf.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::SEE_OTHER);
+    assert!(dns.records.lock().unwrap().iter().all(|r| r["type"] != "A"));
+
+    // A second click during the drain must be a harmless no-op — not a
+    // "drift" error caused by our own earlier deletion.
+    let second = browser
+        .post(format!("{base}/bindings/{binding_id}/remove"))
+        .form(&[("csrf", remove_csrf.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::SEE_OTHER);
+
+    running.shutdown().await;
+    provider_task.abort();
+}
+
+#[tokio::test]
+async fn unbind_succeeds_when_managed_records_were_already_deleted_externally() {
+    let dns = FakeDns {
+        records: Arc::new(Mutex::new(Vec::new())),
+    };
+    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_addr = provider_listener.local_addr().unwrap();
+    let provider = fake_provider_router(dns.clone());
+    let provider_task = tokio::spawn(async move {
+        axum::serve(provider_listener, provider).await.unwrap();
+    });
+
+    let state = TempDir::new().unwrap();
+    let config = Config::for_test(state.path(), "127.0.0.1:0".parse().unwrap())
+        .with_public_ips(vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))])
+        .with_drain_duration(Duration::from_millis(100))
+        .with_cloudflare_endpoints(CloudflareEndpoints {
+            authorization: Url::parse(&format!("http://{provider_addr}/oauth2/auth")).unwrap(),
+            token: Url::parse(&format!("http://{provider_addr}/oauth2/token")).unwrap(),
+            api: Url::parse(&format!("http://{provider_addr}/client/v4/")).unwrap(),
+        });
+    let running = Hostknot::start(config).await.unwrap();
+    let base = format!("http://{}", running.admin_addr());
+    let browser = Client::builder()
+        .redirect(Policy::none())
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    initialize_and_connect(&browser, &base, running.bootstrap_token().unwrap()).await;
+    let csrf = binding_csrf(&browser, &base).await;
+    assert_eq!(
+        create_binding(&browser, &base, &csrf, false).await.status(),
+        StatusCode::SEE_OTHER
+    );
+
+    // The whole record vanished externally (deleted by hand in Cloudflare).
+    // Absence is already-reverted, not drift: unbind proceeds.
+    dns.records.lock().unwrap().retain(|r| r["type"] != "A");
+    let dashboard = browser
+        .get(&base)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let binding_id = data_value(&dashboard, "binding-id");
+    let remove_csrf = hidden_value(&dashboard, "csrf");
+    let removed = browser
+        .post(format!("{base}/bindings/{binding_id}/remove"))
+        .form(&[("csrf", remove_csrf.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), StatusCode::SEE_OTHER);
+
+    running.shutdown().await;
+    provider_task.abort();
+}
+
 fn fake_provider_router(dns: FakeDns) -> Router {
     Router::new()
         .route(

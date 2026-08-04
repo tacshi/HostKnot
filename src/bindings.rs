@@ -123,17 +123,31 @@ impl BindingManager {
         };
         self.store
             .mark_binding_certificate_pending(&binding_id, &receipt)?;
-        if let Err(error) = self.certificates.ensure_dns(&hostname).await {
-            self.store.mark_binding_error(
-                &binding_id,
-                "certificate_pending",
-                &error.to_string(),
-            )?;
-            return Err(error);
+        // A certificate failure here is NOT fatal to the binding: DNS is in
+        // place and reconciliation retries issuance in the background. Return
+        // the binding so the UI shows "certificate pending" instead of
+        // dead-ending the operator on an error page.
+        match self.certificates.ensure_dns(&hostname).await {
+            Ok(()) => {
+                self.store.mark_binding_active(&binding_id)?;
+                self.store
+                    .record_event("binding", &format!("Binding activated: {hostname}"))?;
+            }
+            Err(error) => {
+                self.store.mark_binding_error(
+                    &binding_id,
+                    "certificate_pending",
+                    &error.to_string(),
+                )?;
+                self.store.record_event(
+                    "binding",
+                    &format!(
+                        "Certificate issuance for {hostname} failed and will retry: {error:#}"
+                    ),
+                )?;
+                self.reconcile_nudge.notify_one();
+            }
         }
-        self.store.mark_binding_active(&binding_id)?;
-        self.store
-            .record_event("binding", &format!("Binding activated: {hostname}"))?;
         let binding = self
             .store
             .binding(&binding_id)?
@@ -143,6 +157,12 @@ impl BindingManager {
 
     pub async fn remove(&self, id: &str) -> Result<()> {
         let binding = self.store.binding(id)?.context("binding does not exist")?;
+        // Removal already ran and the route is draining; a second click must
+        // be a harmless no-op, not a second revert that misreads its own
+        // earlier deletion as drift.
+        if binding.status == "draining" {
+            return Ok(());
+        }
         // A binding whose DNS apply never succeeded has no receipt and owns no
         // records, so there is nothing to revert.
         if let Some(receipt) = self.store.binding_receipt(id)?

@@ -223,17 +223,31 @@ async fn index(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Resp
             r#"<section class="table"><table><thead><tr><th>Hostname</th><th>Upstream</th><th>Status / health</th><th>Certificate</th><th>DNS</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table></section>"#
         )
     };
-    let events = state
-        .store
-        .recent_events(20)
-        .unwrap_or_default()
+    let mut grouped: Vec<(crate::store::Event, u32)> = Vec::new();
+    for event in state.store.recent_events(50).unwrap_or_default() {
+        if let Some((last, count)) = grouped.last_mut()
+            && last.kind == event.kind
+            && last.message == event.message
+        {
+            *count += 1;
+        } else {
+            grouped.push((event, 1));
+        }
+    }
+    let events = grouped
         .into_iter()
-        .map(|event| {
+        .take(15)
+        .map(|(event, count)| {
+            let repeat = if count > 1 {
+                format!(r#" <span class="repeat">×{count}</span>"#)
+            } else {
+                String::new()
+            };
             format!(
-                "<li><strong>{}</strong> {} <time>{}</time></li>",
+                r#"<li><span class="tag">{}</span><span class="event-message">{}{repeat}</span><time>{}</time></li>"#,
                 escape_html(&event.kind),
                 escape_html(&event.message),
-                event.created_at
+                format_timestamp(event.created_at)
             )
         })
         .collect::<String>();
@@ -410,15 +424,19 @@ async fn disconnect_cloudflare(
         .into_iter()
         .any(|binding| !matches!(binding.status.as_str(), "dns_pending" | "draining"));
     if blocking {
-        return (
+        return error_page(
             StatusCode::CONFLICT,
-            "Remove all active bindings before disconnecting Cloudflare",
-        )
-            .into_response();
+            "Bindings still depend on Cloudflare",
+            "Remove all active bindings before disconnecting Cloudflare, so their DNS records can be reverted safely.",
+        );
     }
     match state.cloudflare.disconnect().await {
         Ok(()) => Redirect::to("/providers/cloudflare").into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Disconnect failed",
+            &error.to_string(),
+        ),
     }
 }
 
@@ -443,7 +461,11 @@ async fn configure_cloudflare(
         .configure(&form.client_id, &form.client_secret, &form.scopes)
     {
         Ok(()) => Redirect::to("/providers/cloudflare").into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        Err(error) => error_page(
+            StatusCode::BAD_REQUEST,
+            "Couldn't save the OAuth client",
+            &error.to_string(),
+        ),
     }
 }
 
@@ -456,7 +478,11 @@ async fn connect_cloudflare(State(state): State<Arc<AdminState>>, headers: Heade
     }
     match state.cloudflare.authorization_url(session) {
         Ok(url) => Redirect::to(url.as_str()).into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        Err(error) => error_page(
+            StatusCode::BAD_REQUEST,
+            "Couldn't start Cloudflare authorization",
+            &error.to_string(),
+        ),
     }
 }
 
@@ -547,7 +573,7 @@ async fn new_binding_page(State(state): State<Arc<AdminState>>, headers: HeaderM
     Html(page(
         "New binding",
         &format!(
-            r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">NEW ROUTE</span><h1>Bind a domain</h1><form method="post" action="/bindings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="replace_existing" value="false"><div class="managed-tls"><strong>Public HTTPS included</strong><span>Hostknot obtains and renews the domain certificate automatically.</span></div><label>Hostname<input name="hostname" placeholder="app.example.com" required></label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" list="ports" required><datalist id="ports">{ports}</datalist></label><details class="local-options"><summary>Local connection options</summary><label>Local service protocol<select name="upstream_scheme"><option value="http" selected>HTTP</option><option value="https">HTTPS</option></select><small class="form-help">Use HTTPS only when the local service itself requires it. Private and self-signed loopback certificates are accepted automatically.</small></label></details><label class="check"><input name="proxied" type="checkbox" value="true" checked> Enable Cloudflare proxy</label><button type="submit">Bind domain</button></form></main>"#,
+            r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">NEW ROUTE</span><h1>Bind a domain</h1><form method="post" action="/bindings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="replace_existing" value="false"><div class="managed-tls"><strong>Public HTTPS included</strong><span>Hostknot obtains and renews the domain certificate automatically.</span></div><label>Hostname<input name="hostname" placeholder="app.example.com" required><small class="form-help">The exact domain visitors will use. Its zone must be in your connected Cloudflare account.</small></label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" list="ports" required><datalist id="ports">{ports}</datalist><small class="form-help">The loopback port your service listens on — detected listeners are suggested as you type.</small></label><details class="local-options"><summary>Local connection options</summary><label>Local service protocol<select name="upstream_scheme"><option value="http" selected>HTTP</option><option value="https">HTTPS</option></select><small class="form-help">Use HTTPS only when the local service itself requires it. Private and self-signed loopback certificates are accepted automatically.</small></label></details><label class="check"><input name="proxied" type="checkbox" value="true" checked> Enable Cloudflare proxy</label><small class="form-help check-help">Serves traffic through Cloudflare’s network and hides this server’s IP. Uncheck for direct DNS records.</small><button type="submit">Bind domain</button></form></main>"#,
             escape_html(&csrf)
         ),
     ))
@@ -604,7 +630,11 @@ async fn create_binding(
                 input.insecure_tls
             ),
         )).into_response_with_status(StatusCode::CONFLICT),
-        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        Err(error) => error_page(
+            StatusCode::BAD_REQUEST,
+            "Couldn't bind that domain",
+            &error.to_string(),
+        ),
     }
 }
 
@@ -677,10 +707,17 @@ async fn update_binding(
         .await
     {
         Ok(()) => Redirect::to("/").into_response(),
-        Err(error) if crate::provider::is_drift(&error) => {
-            (StatusCode::CONFLICT, error.to_string()).into_response()
-        }
-        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        Err(error) if crate::provider::is_drift(&error) => error_page(
+            StatusCode::CONFLICT,
+            "DNS records changed outside Hostknot",
+            "A managed record was modified by something else, so Hostknot left everything untouched. \
+             Fix or restore the records in Cloudflare; Hostknot re-checks automatically and will finish this operation.",
+        ),
+        Err(error) => error_page(
+            StatusCode::BAD_REQUEST,
+            "Couldn't apply that change",
+            &error.to_string(),
+        ),
     }
 }
 
@@ -700,10 +737,17 @@ async fn remove_binding(
     }
     match state.bindings.remove(&id).await {
         Ok(()) => Redirect::to("/").into_response(),
-        Err(error) if crate::provider::is_drift(&error) => {
-            (StatusCode::CONFLICT, error.to_string()).into_response()
-        }
-        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        Err(error) if crate::provider::is_drift(&error) => error_page(
+            StatusCode::CONFLICT,
+            "DNS records changed outside Hostknot",
+            "A managed record was modified by something else, so Hostknot left everything untouched. \
+             Fix or restore the records in Cloudflare; Hostknot re-checks automatically and will finish this operation.",
+        ),
+        Err(error) => error_page(
+            StatusCode::BAD_REQUEST,
+            "Couldn't apply that change",
+            &error.to_string(),
+        ),
     }
 }
 
@@ -777,17 +821,18 @@ fn require_csrf(state: &AdminState, headers: &HeaderMap, supplied: &str) -> Opti
         Some(_) => false,
     };
     if !origin_is_valid {
-        return Some((StatusCode::FORBIDDEN, "Cross-origin request rejected").into_response());
+        return Some(error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "This submission did not come from the Hostknot admin pages, so it was rejected for safety.",
+        ));
     }
     if !bool::from(expected.as_bytes().ct_eq(supplied.as_bytes())) {
-        return Some(
-            (
-                StatusCode::FORBIDDEN,
-                "This form is stale (it was loaded under a previous session). \
-                 Go back, refresh the page, and try again.",
-            )
-                .into_response(),
-        );
+        return Some(error_page(
+            StatusCode::FORBIDDEN,
+            "This page went stale",
+            "It was loaded under a previous session. Go back to the bindings page and try again from there.",
+        ));
     }
     None
 }
@@ -881,6 +926,20 @@ fn page(title: &str, body: &str) -> String {
     page_with_head(title, "", body)
 }
 
+/// Every failure the operator can hit renders as a styled page with a way
+/// back — never a bare text response.
+fn error_page(status: StatusCode, title: &str, message: &str) -> Response {
+    Html(page(
+        title,
+        &format!(
+            r#"<main class="narrow"><span class="eyebrow">SOMETHING NEEDS ATTENTION</span><h1>{}</h1><p class="error-detail">{}</p><p><a class="button" href="/">Back to bindings</a></p></main>"#,
+            escape_html(title),
+            escape_html(message)
+        ),
+    ))
+    .into_response_with_status(status)
+}
+
 fn page_with_head(title: &str, head: &str, body: &str) -> String {
     format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">{head}<title>{title} · Hostknot</title><style>{CSS}</style></head><body>{body}</body></html>"#
@@ -894,6 +953,19 @@ fn escape_html(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn format_timestamp(unix: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(unix)
+        .ok()
+        .and_then(|moment| {
+            let format = time::format_description::parse_borrowed::<2>(
+                "[year]-[month]-[day] [hour]:[minute] UTC",
+            )
+            .ok()?;
+            moment.format(&format).ok()
+        })
+        .unwrap_or_else(|| unix.to_string())
 }
 
 fn title_status(status: &str) -> String {
@@ -1010,6 +1082,19 @@ th{color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.
 .row-actions button,.row-actions .button{padding:10px 16px}
 .pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:3px 10px}
 .pill.active{border-color:#65d68b;color:var(--accent)}
+.pill.degraded{border-color:#f2c94c88;color:#f2d98a}
+.pill.drifted{border-color:#ffb4a988;color:#ffb4a9}
+.pill.draining,.pill.dns_pending,.pill.certificate_pending{color:var(--muted)}
+.check-help{margin:-12px 0 20px 30px}
+.error-detail{overflow-wrap:anywhere}
+.events ol{list-style:none;margin:0;padding:0}
+.events li{display:flex;align-items:baseline;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}
+.events li:last-child{border-bottom:0}
+.events .tag{flex-shrink:0;border:1px solid var(--line);border-radius:6px;padding:1px 8px;color:var(--muted);font-size:.7rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase}
+.events .event-message{min-width:0;overflow-wrap:anywhere}
+.events .repeat{color:var(--muted);font-size:.8rem}
+.events time{margin-left:auto;flex-shrink:0;color:var(--muted);font-size:.8rem;white-space:nowrap}
+@media(max-width:600px){.events time{display:none}}
 @media(max-width:1100px){
   .table table,.table tbody{display:block}
   .table thead{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}

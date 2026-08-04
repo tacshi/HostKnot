@@ -595,21 +595,26 @@ impl DnsProvider for Cloudflare {
         let current = self
             .records(&access_token, &receipt.zone_id, hostname)
             .await?;
+        // Drift means a managed record was CHANGED by someone else. A record
+        // that is simply absent is already reverted — our own earlier
+        // deletion (double unbind, crash mid-revert) must not strand the
+        // binding in a drift state.
         for managed in &receipt.created {
-            let unchanged = current.iter().any(|record| {
-                record.id == managed.id
-                    && record.record_type == managed.record_type
-                    && record.name == managed.name
-                    && record.content == managed.content
-                    && record.proxied == managed.proxied
-            });
-            if !unchanged {
-                return Err(DnsError::Drift.into());
+            match current.iter().find(|record| record.id == managed.id) {
+                None => {}
+                Some(record)
+                    if record.record_type == managed.record_type
+                        && record.name == managed.name
+                        && record.content == managed.content
+                        && record.proxied == managed.proxied => {}
+                Some(_) => return Err(DnsError::Drift.into()),
             }
         }
         for record in &receipt.created {
-            self.delete_record(&access_token, &receipt.zone_id, &record.id)
-                .await?;
+            if current.iter().any(|existing| existing.id == record.id) {
+                self.delete_record(&access_token, &receipt.zone_id, &record.id)
+                    .await?;
+            }
         }
         for record in &receipt.replaced {
             // Restore idempotently: an operator may already have re-created
