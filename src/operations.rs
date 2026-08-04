@@ -85,13 +85,17 @@ pub fn install_systemd(options: InstallOptions<'_>) -> Result<()> {
     let same_binary = binary_path.exists()
         && fs::canonicalize(options.binary).ok() == fs::canonicalize(&binary_path).ok();
     if !same_binary {
-        fs::copy(options.binary, &binary_path).with_context(|| {
-            format!(
-                "install {} as {}",
-                options.binary.display(),
-                binary_path.display()
-            )
+        // Stage and rename instead of copying in place: overwriting a binary
+        // the running service is executing fails with ETXTBSY on Linux, which
+        // silently broke live upgrades. A rename swaps the path atomically
+        // while the old inode keeps serving the running process.
+        let staged = binary_path.with_extension("staged");
+        fs::copy(options.binary, &staged).with_context(|| {
+            format!("stage {} as {}", options.binary.display(), staged.display())
         })?;
+        set_mode(&staged, 0o755)?;
+        fs::rename(&staged, &binary_path)
+            .with_context(|| format!("install staged binary as {}", binary_path.display()))?;
     }
     set_mode(&binary_path, 0o755)?;
     // The state directory and master key are deliberately NOT created here:
