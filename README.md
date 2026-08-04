@@ -64,12 +64,13 @@ It looks like `https://<YOUR_VPS_IP>:9443/setup?token=...`. The token is single-
 
    Full walkthrough: [docs/cloudflare-oauth.md](docs/cloudflare-oauth.md).
 
-**5. Bind a domain.** Click **New binding**, pick a discovered local port (or type one), enter the hostname, and bind. Hostknot creates the DNS records, obtains the certificate, and starts routing — typically within seconds.
+**5. Bind a domain.** Click **New binding**, pick a discovered local port (or type one), enter the hostname, and bind. Hostknot creates the DNS records, obtains the certificate, and starts routing — typically within seconds. Most local apps speak plain HTTP; leave the protocol on its HTTP default and Hostknot still serves the public side over HTTPS.
 
 ## What to expect from bindings
 
 - **Exact hostnames only.** `app.example.com` matches `app.example.com` — no wildcards, no path routing. Hostnames are immutable; to rename, create a replacement binding.
-- **Editable after creation:** upstream port and protocol, the Cloudflare proxied/DNS-only mode, and the untrusted-upstream-certificate override.
+- **Editable after creation:** the local port and protocol, and the Cloudflare proxied/DNS-only mode.
+- **Certificate hiccups don't dead-end.** If issuance is delayed (DNS propagation, a busy CA), the binding shows *Certificate pending* on the dashboard and retries in the background with backoff — no action needed.
 - **Conflicts need confirmation.** If the hostname already has A/AAAA/CNAME records, Hostknot shows exactly what it would replace, saves the originals, and restores them on unbind.
 - **Drift is never destroyed.** If someone changes the records outside Hostknot, unbinding stops and reports the drift instead of overwriting external changes; once resolved, removal completes automatically.
 - **Unbinding drains.** DNS records are removed first, then the route keeps serving for five minutes so cached DNS doesn't hit a dead endpoint.
@@ -126,7 +127,7 @@ Reinstalls never touch an existing config, so a changed VPS address is a manual 
 - **Least privilege.** The systemd unit runs under a private dynamic user with `CAP_NET_BIND_SERVICE` as its only capability, a read-only host filesystem, and a writable state directory.
 - **Encrypted at rest.** OAuth secrets and tokens, ACME account credentials, and certificate keys are sealed with XChaCha20-Poly1305 under a mode-`0600` master key (context-bound so ciphertexts can't be swapped between columns). The service refuses to start if the key is readable by other users. Only Argon2id hashes are stored for the admin password.
 - **Hardened admin surface.** HTTPS with a trusted IP certificate, HTTP-only same-site session cookies, per-session CSRF tokens with origin checks, per-IP login throttling, expiring single-use setup/reset tokens, OAuth state bound to the initiating session (PKCE S256), and strict security headers.
-- **Contained proxying.** Upstreams are pinned to loopback — the proxy cannot be pointed at arbitrary hosts. Inbound `X-Forwarded-*` headers are overwritten, hop-by-hop headers are stripped, and upstream failures return an opaque 502. HTTPS upstream certificates are verified against the binding hostname unless explicitly overridden.
+- **Contained proxying.** Upstreams are pinned to loopback — the proxy cannot be pointed at arbitrary hosts. Inbound `X-Forwarded-*` headers are overwritten, hop-by-hop headers are stripped, and upstream failures return an opaque 502. For HTTPS upstreams, private and self-signed certificates are accepted automatically: that hop never leaves the machine, while the public-facing side always serves real, verified certificates.
 
 ## Troubleshooting
 
