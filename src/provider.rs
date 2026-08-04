@@ -44,10 +44,19 @@ fn default_ttl() -> u32 {
 /// these so callers can `downcast_ref` instead of matching error strings.
 #[derive(Debug, thiserror::Error)]
 pub enum DnsError {
+    #[error("DNS provider authorization is required")]
+    AuthorizationRequired,
     #[error("DNS conflict: the hostname already has A, AAAA, or CNAME records")]
     Conflict,
     #[error("DNS drift detected; Hostknot left external records untouched")]
     Drift,
+}
+
+pub fn is_authorization_required(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<DnsError>(),
+        Some(DnsError::AuthorizationRequired)
+    )
 }
 
 pub fn is_conflict(error: &anyhow::Error) -> bool {

@@ -217,7 +217,7 @@ impl Cloudflare {
         let current = self
             .store
             .cloudflare_tokens()?
-            .context("Cloudflare authorization is required")?;
+            .ok_or(DnsError::AuthorizationRequired)?;
         if current.expires_at > unix_now() + 30 {
             return Ok(current.access_token);
         }
@@ -226,14 +226,14 @@ impl Cloudflare {
         let current = self
             .store
             .cloudflare_tokens()?
-            .context("Cloudflare authorization is required")?;
+            .ok_or(DnsError::AuthorizationRequired)?;
         if current.expires_at > unix_now() + 30 {
             return Ok(current.access_token);
         }
         let refresh_token = current
             .refresh_token
             .as_deref()
-            .context("Cloudflare authorization expired and no refresh token is available")?;
+            .ok_or(DnsError::AuthorizationRequired)?;
         let config = self
             .store
             .cloudflare_configuration()?

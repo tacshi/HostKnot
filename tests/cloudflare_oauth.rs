@@ -18,6 +18,127 @@ use tokio::net::TcpListener;
 use url::Url;
 
 #[tokio::test]
+async fn binding_submission_starts_cloudflare_authorization_when_tokens_are_missing() {
+    let state = TempDir::new().unwrap();
+    let config = Config::for_test(
+        state.path(),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+    )
+    .with_cloudflare_endpoints(CloudflareEndpoints {
+        authorization: Url::parse("https://dash.cloudflare.test/oauth2/auth").unwrap(),
+        token: Url::parse("https://dash.cloudflare.test/oauth2/token").unwrap(),
+        api: Url::parse("https://api.cloudflare.test/client/v4/").unwrap(),
+    });
+    let running = Hostknot::start(config).await.unwrap();
+    let base = format!("http://{}", running.admin_addr());
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let bootstrap = running.bootstrap_token().unwrap();
+    client
+        .post(format!("{base}/setup"))
+        .form(&[
+            ("token", bootstrap.as_str()),
+            ("password", "correct horse battery staple"),
+            ("acme_email", "operator@example.com"),
+        ])
+        .send()
+        .await
+        .unwrap();
+
+    let provider_page = client
+        .get(format!("{base}/providers/cloudflare"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/providers/cloudflare/configure"))
+        .form(&[
+            ("csrf", hidden_value(&provider_page, "csrf").as_str()),
+            ("client_id", "private-client-id"),
+            ("client_secret", "private-client-secret"),
+            ("scopes", "zone.read dns.write offline_access"),
+        ])
+        .send()
+        .await
+        .unwrap();
+
+    let binding_page = client
+        .get(format!("{base}/bindings/new"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let response = client
+        .post(format!("{base}/bindings"))
+        .form(&[
+            ("csrf", hidden_value(&binding_page, "csrf").as_str()),
+            ("hostname", "needs-auth.example.com"),
+            ("upstream_scheme", "http"),
+            ("upstream_port", "8080"),
+            ("proxied", "true"),
+            ("insecure_tls", "false"),
+            ("replace_existing", "false"),
+        ])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()["location"],
+        "/providers/cloudflare/connect/start"
+    );
+
+    let start = client
+        .get(format!("{base}/providers/cloudflare/connect/start"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::OK);
+    assert!(
+        start
+            .text()
+            .await
+            .unwrap()
+            .contains("url=/providers/cloudflare/connect")
+    );
+
+    let connect = client
+        .get(format!("{base}/providers/cloudflare/connect"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(connect.status(), StatusCode::SEE_OTHER);
+    let authorization = Url::parse(connect.headers()["location"].to_str().unwrap()).unwrap();
+    assert_eq!(authorization.host_str(), Some("dash.cloudflare.test"));
+    let query: HashMap<_, _> = authorization.query_pairs().into_owned().collect();
+    assert_eq!(query["client_id"], "private-client-id");
+    assert_eq!(query["response_type"], "code");
+    assert_eq!(query["code_challenge_method"], "S256");
+
+    let dashboard = client
+        .get(&base)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(dashboard.contains("needs-auth.example.com"));
+    assert!(dashboard.contains("dns_pending"));
+
+    running.shutdown().await;
+}
+
+#[tokio::test]
 async fn cloudflare_oauth_uses_pkce_and_rejects_callback_replay() {
     let token_grants = Arc::new(Mutex::new(Vec::new()));
     let rate_limited = Arc::new(AtomicBool::new(false));

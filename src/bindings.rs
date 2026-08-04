@@ -216,6 +216,10 @@ impl BindingManager {
         self.reconcile_nudge.notified().await;
     }
 
+    pub fn nudge_reconciliation(&self) {
+        self.reconcile_nudge.notify_one();
+    }
+
     pub async fn reconcile_once(&self) -> Result<bool> {
         let mut pending = false;
         for binding in self.store.list_bindings()? {

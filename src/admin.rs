@@ -74,6 +74,10 @@ pub fn router(state: Arc<AdminState>) -> Router {
             "/providers/cloudflare/configure",
             axum::routing::post(configure_cloudflare),
         )
+        .route(
+            "/providers/cloudflare/connect/start",
+            get(start_cloudflare_connect),
+        )
         .route("/providers/cloudflare/connect", get(connect_cloudflare))
         .route(
             "/providers/cloudflare/disconnect",
@@ -376,6 +380,24 @@ async fn connect_cloudflare(State(state): State<Arc<AdminState>>, headers: Heade
     }
 }
 
+async fn start_cloudflare_connect(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(session) = cookie(&headers, "hostknot_session") else {
+        return Redirect::to("/login").into_response();
+    };
+    if !state.store.session_valid(session).unwrap_or(false) {
+        return Redirect::to("/login").into_response();
+    }
+    Html(page_with_head(
+        "Continue to Cloudflare",
+        r#"<meta http-equiv="refresh" content="0;url=/providers/cloudflare/connect">"#,
+        r#"<main class="narrow"><span class="eyebrow">DNS PROVIDER</span><h1>Opening Cloudflare</h1><p>If authorization does not open automatically, continue below.</p><p><a class="button" href="/providers/cloudflare/connect">Authorize with Cloudflare</a></p></main>"#,
+    ))
+    .into_response()
+}
+
 #[derive(Deserialize)]
 struct OAuthCallback {
     code: Option<String>,
@@ -421,7 +443,10 @@ async fn cloudflare_callback(
         .complete_authorization(&code, &oauth_state, session)
         .await
     {
-        Ok(()) => Redirect::to("/providers/cloudflare").into_response(),
+        Ok(()) => {
+            state.bindings.nudge_reconciliation();
+            Redirect::to("/providers/cloudflare").into_response()
+        }
         Err(_) => (
             StatusCode::BAD_REQUEST,
             "Cloudflare authorization could not be completed",
@@ -481,6 +506,12 @@ async fn create_binding(
     };
     match state.bindings.create(input.clone()).await {
         Ok(_) => Redirect::to("/").into_response(),
+        Err(error) if crate::provider::is_authorization_required(&error) => {
+            if !state.cloudflare.configured() {
+                return Redirect::to("/providers/cloudflare").into_response();
+            }
+            Redirect::to("/providers/cloudflare/connect/start").into_response()
+        }
         Err(error) if crate::provider::is_conflict(&error) => Html(page(
             "Confirm DNS replacement",
             &format!(
@@ -768,8 +799,12 @@ async fn security_headers(request: axum::extract::Request, next: Next) -> Respon
 }
 
 fn page(title: &str, body: &str) -> String {
+    page_with_head(title, "", body)
+}
+
+fn page_with_head(title: &str, head: &str, body: &str) -> String {
     format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · Hostknot</title><style>{CSS}</style></head><body>{body}</body></html>"#
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">{head}<title>{title} · Hostknot</title><style>{CSS}</style></head><body>{body}</body></html>"#
     )
 }
 
