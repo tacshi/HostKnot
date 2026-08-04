@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     let config = Config::for_test(&state, address)
         .with_proxy_listeners("127.0.0.1:0".parse()?, "127.0.0.1:0".parse()?)
         .with_public_ips(vec!["203.0.113.10".parse()?])
-        .with_drain_duration(Duration::from_millis(500))
+        .with_drain_duration(Duration::from_secs(2))
         .with_cloudflare_endpoints(CloudflareEndpoints {
             authorization: Url::parse(&format!("http://{provider_addr}/oauth2/auth"))?,
             token: Url::parse(&format!("http://{provider_addr}/oauth2/token"))?,

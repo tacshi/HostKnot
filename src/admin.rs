@@ -134,26 +134,59 @@ async fn index(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Resp
         let rows = bindings
             .iter()
             .map(|binding| {
+                let draining = binding.status == "draining";
+                let health = if draining {
+                    "Cached traffic is still served briefly".to_owned()
+                } else {
+                    title_status(&binding.health)
+                };
+                let certificate = if draining {
+                    "Retained during drain".to_owned()
+                } else {
+                    format!(
+                        "{}<small>{}</small>",
+                        title_status(&binding.certificate_status),
+                        binding
+                            .last_error
+                            .as_deref()
+                            .map(escape_html)
+                            .unwrap_or_default()
+                    )
+                };
+                let dns = if draining {
+                    "Released".to_owned()
+                } else if binding.proxied {
+                    "Cloudflare proxied".to_owned()
+                } else {
+                    "DNS only".to_owned()
+                };
+                let actions = if draining {
+                    r#"<span class="muted">Removal in progress</span>"#.to_owned()
+                } else {
+                    format!(
+                        r#"<a href="/bindings/{}/edit">Edit</a><form class="inline" method="post" action="/bindings/{}/remove"><input type="hidden" name="csrf" value="{}"><button class="danger" type="submit">Unbind</button></form>"#,
+                        binding.id,
+                        binding.id,
+                        escape_html(&csrf)
+                    )
+                };
                 format!(
-                    r#"<tr data-binding-id="{}"><td><strong>{}</strong></td><td><code>{}://127.0.0.1:{}</code></td><td><span class="pill {}">{}</span><small>{}</small></td><td>{}<small>{}</small></td><td>{}</td><td><a href="/bindings/{}/edit">Edit</a><form class="inline" method="post" action="/bindings/{}/remove"><input type="hidden" name="csrf" value="{}"><button class="danger" type="submit">Unbind</button></form></td></tr>"#,
+                    r#"<tr data-binding-id="{}"><td data-label="Hostname"><strong>{}</strong></td><td data-label="Upstream"><code class="upstream">{}://127.0.0.1:{}</code></td><td data-label="Status / health"><span class="pill {}">{}</span><small>{}</small></td><td data-label="Certificate">{}</td><td data-label="DNS">{}</td><td class="actions" data-label="Actions">{}</td></tr>"#,
                     binding.id,
                     escape_html(&binding.hostname),
                     binding.upstream_scheme,
                     binding.upstream_port,
                     binding.status,
                     title_status(&binding.status),
-                    title_status(&binding.health),
-                    title_status(&binding.certificate_status),
-                    binding.last_error.as_deref().map(escape_html).unwrap_or_default(),
-                    if binding.proxied { "Cloudflare proxied" } else { "DNS only" },
-                    binding.id,
-                    binding.id,
-                    escape_html(&csrf)
+                    health,
+                    certificate,
+                    dns,
+                    actions
                 )
             })
             .collect::<String>();
         format!(
-            r#"<section class="table"><table><thead><tr><th>Hostname</th><th>Upstream</th><th>Status / health</th><th>Certificate</th><th>DNS</th><th></th></tr></thead><tbody>{rows}</tbody></table></section>"#
+            r#"<section class="table"><table><thead><tr><th>Hostname</th><th>Upstream</th><th>Status / health</th><th>Certificate</th><th>DNS</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table></section>"#
         )
     };
     let events = state
@@ -874,5 +907,57 @@ fn discover_listening_ports() -> Vec<u16> {
 }
 
 const CSS: &str = r#"
-:root{color-scheme:dark;--bg:#101311;--panel:#181d1a;--line:#303a33;--ink:#f4f7f4;--muted:#9ba89f;--accent:#a7f3c3}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top right,#20352a 0,transparent 32rem),var(--bg);color:var(--ink);font:16px/1.5 ui-sans-serif,system-ui,sans-serif;min-height:100vh}main{max-width:1050px;margin:0 auto;padding:64px 28px}.narrow{max-width:620px}.eyebrow{color:var(--accent);font-size:.75rem;font-weight:800;letter-spacing:.18em}.block{display:block;margin-top:2rem}header{display:flex;align-items:flex-end;justify-content:space-between;flex-wrap:wrap;gap:24px}header>div{min-width:0}nav{display:flex;align-items:center;flex-wrap:wrap;gap:18px}h1{font-size:clamp(2.2rem,6vw,4rem);line-height:1;margin:.25rem 0 1rem;letter-spacing:-.05em;overflow-wrap:anywhere}h2{margin-top:0}p{color:var(--muted)}a{color:var(--accent)}form,.empty,.instructions,.status,.table,.events{margin-top:2rem;padding:28px;border:1px solid var(--line);border-radius:18px;background:color-mix(in srgb,var(--panel) 94%,transparent);box-shadow:0 24px 80px #0005}.inline{margin:0;padding:0;border:0;background:none;box-shadow:none}.status{display:flex;justify-content:space-between;gap:18px}.status span,small{display:block;color:var(--muted)}label{display:block;color:var(--muted);font-size:.875rem;margin-bottom:20px}input,select{width:100%;margin-top:7px;border:1px solid var(--line);border-radius:10px;background:#0d100e;color:var(--ink);font:inherit;padding:12px 14px;outline:none}.check{display:flex;align-items:center;gap:10px}.check input{width:auto;margin:0}input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px #a7f3c322}button,.button{display:inline-block;border:0;border-radius:999px;background:var(--accent);color:#102117;font:inherit;font-weight:800;padding:12px 20px;cursor:pointer;text-decoration:none}.danger{background:#ffb4a9;color:#3b0a06}code{overflow-wrap:anywhere;background:#0b0e0c;padding:6px 9px;border-radius:8px;color:#d6ffe5}.instructions code{display:block;padding:12px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:14px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.1em}.pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:3px 10px}.pill.active{border-color:#65d68b;color:var(--accent)}@media(max-width:900px){header{align-items:flex-start;flex-direction:column}.table{overflow:auto}}@media(max-width:500px){main{padding:40px 18px}form,.empty,.instructions,.status,.table,.events{padding:20px}}
+:root{color-scheme:dark;--bg:#101311;--panel:#181d1a;--line:#303a33;--ink:#f4f7f4;--muted:#9ba89f;--accent:#a7f3c3}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(circle at top right,#20352a 0,transparent 32rem),var(--bg);color:var(--ink);font:16px/1.5 ui-sans-serif,system-ui,sans-serif;min-height:100vh}
+main{max-width:1050px;margin:0 auto;padding:64px 28px}
+.narrow{max-width:620px}
+.eyebrow{color:var(--accent);font-size:.75rem;font-weight:800;letter-spacing:.18em}
+.block{display:block;margin-top:2rem}
+header{display:flex;align-items:flex-end;justify-content:space-between;flex-wrap:wrap;gap:24px}
+header>div{min-width:0}
+nav{display:flex;align-items:center;flex-wrap:wrap;gap:18px}
+h1{font-size:clamp(2.2rem,6vw,4rem);line-height:1;margin:.25rem 0 1rem;letter-spacing:-.05em;overflow-wrap:anywhere}
+h2{margin-top:0}
+p{color:var(--muted)}
+a{color:var(--accent)}
+form,.empty,.instructions,.status,.table,.events{margin-top:2rem;padding:28px;border:1px solid var(--line);border-radius:18px;background:color-mix(in srgb,var(--panel) 94%,transparent);box-shadow:0 24px 80px #0005}
+.inline{margin:0;padding:0;border:0;background:none;box-shadow:none}
+.status{display:flex;justify-content:space-between;gap:18px}
+.status span,small,.muted{display:block;color:var(--muted)}
+label{display:block;color:var(--muted);font-size:.875rem;margin-bottom:20px}
+input,select{width:100%;margin-top:7px;border:1px solid var(--line);border-radius:10px;background:#0d100e;color:var(--ink);font:inherit;padding:12px 14px;outline:none}
+.check{display:flex;align-items:center;gap:10px}
+.check input{width:auto;margin:0}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px #a7f3c322}
+button,.button{display:inline-block;border:0;border-radius:999px;background:var(--accent);color:#102117;font:inherit;font-weight:800;padding:12px 20px;cursor:pointer;text-decoration:none}
+.danger{background:#ffb4a9;color:#3b0a06}
+code{overflow-wrap:anywhere;background:#0b0e0c;padding:6px 9px;border-radius:8px;color:#d6ffe5}
+code.upstream{display:inline-block;max-width:100%;overflow-x:auto;overflow-wrap:normal;white-space:nowrap}
+.instructions code{display:block;padding:12px}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:14px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.1em}
+.actions{white-space:nowrap}
+.actions .inline{margin-top:10px}
+.pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:3px 10px}
+.pill.active{border-color:#65d68b;color:var(--accent)}
+@media(max-width:900px){
+  header{align-items:flex-start;flex-direction:column}
+  .table table,.table tbody{display:block}
+  .table thead{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+  .table tr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;padding:22px 0;border-bottom:1px solid var(--line)}
+  .table tr:first-child{padding-top:0}
+  .table tr:last-child{padding-bottom:0;border-bottom:0}
+  .table td{display:block;min-width:0;padding:0;border:0}
+  .table td::before{content:attr(data-label);display:block;margin-bottom:7px;color:var(--muted);font-size:.75rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase}
+  .table .actions{grid-column:1/-1;white-space:normal}
+  .table .actions .inline{display:inline-block;margin:0 0 0 12px}
+}
+@media(max-width:500px){
+  main{padding:40px 18px}
+  form,.empty,.instructions,.status,.table,.events{padding:20px}
+  .table tr{grid-template-columns:1fr}
+  .table .actions{grid-column:auto}
+}
 "#;

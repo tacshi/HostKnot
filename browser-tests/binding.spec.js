@@ -43,6 +43,16 @@ test("connect Cloudflare, bind, confirm replacement, and unbind", async ({ page 
     await expect(appRow.locator(".pill.active")).toBeVisible();
   }).toPass({ timeout: 15_000 });
 
+  // The table must stay readable at the tablet-sized viewport from the
+  // reported UI: an upstream address is one unit and must not split mid-IP.
+  await page.setViewportSize({ width: 810, height: 900 });
+  const upstreamLines = await appRow.locator("code").evaluate(element => {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    return range.getClientRects().length;
+  });
+  expect(upstreamLines).toBe(1);
+
   // A hostname with pre-existing records goes through the confirmation
   // interstitial before anything is replaced.
   await page.goto(`${fixture.baseUrl}/bindings/new`);
@@ -59,8 +69,12 @@ test("connect Cloudflare, bind, confirm replacement, and unbind", async ({ page 
       .filter({ hasText: "conflict.example.com" })
   ).toBeVisible();
 
-  // Unbind drains and then disappears from the dashboard.
+  // Unbind becomes a read-only draining state, then disappears.
   await appRow.getByRole("button", { name: "Unbind" }).click();
+  await expect(appRow.locator(".pill.draining")).toBeVisible();
+  await expect(appRow.getByRole("link", { name: "Edit" })).toHaveCount(0);
+  await expect(appRow.getByRole("button", { name: "Unbind" })).toHaveCount(0);
+  await expect(appRow.getByText("Removal in progress")).toBeVisible();
   await expect(async () => {
     await page.goto(fixture.baseUrl);
     await expect(
