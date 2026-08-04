@@ -262,6 +262,35 @@ async fn time_based_expiries_are_enforced() {
         .unwrap();
     assert_eq!(released.status(), StatusCode::UNAUTHORIZED);
 
+    // Binding Hostknot's own admin port is rejected with an explanation.
+    let bindings_page = client
+        .get(format!("{base}/bindings/new"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let admin_port = base.rsplit(':').next().unwrap().to_owned();
+    let own_port = client
+        .post(format!("{base}/bindings"))
+        .form(&[
+            ("csrf", hidden_value(&bindings_page, "csrf").as_str()),
+            ("hostname", "admin.example.com"),
+            ("upstream_scheme", "http"),
+            ("upstream_port", &admin_port),
+            ("proxied", "true"),
+            ("insecure_tls", "false"),
+            ("replace_existing", "false"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(own_port.status(), StatusCode::BAD_REQUEST);
+    let body = own_port.text().await.unwrap();
+    assert!(body.contains("Hostknot's own listeners"));
+    assert!(body.contains("admin UI"));
+
     // Sessions expire after twelve hours.
     assert_eq!(
         client.get(&base).send().await.unwrap().status(),
@@ -271,6 +300,25 @@ async fn time_based_expiries_are_enforced() {
     let expired_session = client.get(&base).send().await.unwrap();
     assert_eq!(expired_session.status(), StatusCode::SEE_OTHER);
     assert_eq!(expired_session.headers()["location"], "/login");
+
+    // A mutating POST with an expired session redirects to login instead of
+    // dead-ending on a CSRF error.
+    let expired_post = client
+        .post(format!("{base}/bindings"))
+        .form(&[
+            ("csrf", hidden_value(&bindings_page, "csrf").as_str()),
+            ("hostname", "app.example.com"),
+            ("upstream_scheme", "http"),
+            ("upstream_port", "8080"),
+            ("proxied", "true"),
+            ("insecure_tls", "false"),
+            ("replace_existing", "false"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(expired_post.status(), StatusCode::SEE_OTHER);
+    assert_eq!(expired_post.headers()["location"], "/login");
 
     running.shutdown().await;
 }

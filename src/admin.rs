@@ -268,8 +268,8 @@ async fn logout(
     headers: HeaderMap,
     Form(form): Form<CsrfForm>,
 ) -> Response {
-    if !valid_csrf(&state, &headers, &form.csrf) {
-        return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
+    if let Some(rejection) = require_csrf(&state, &headers, &form.csrf) {
+        return rejection;
     }
     if let Some(session) = cookie(&headers, "hostknot_session") {
         let _ = state.store.destroy_session(session);
@@ -312,8 +312,8 @@ async fn disconnect_cloudflare(
     headers: HeaderMap,
     Form(form): Form<CsrfForm>,
 ) -> Response {
-    if !valid_csrf(&state, &headers, &form.csrf) {
-        return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
+    if let Some(rejection) = require_csrf(&state, &headers, &form.csrf) {
+        return rejection;
     }
     // Bindings that never obtained records (dns_pending) or already gave them
     // up (draining) do not depend on the provider and must not block
@@ -350,8 +350,8 @@ async fn configure_cloudflare(
     headers: HeaderMap,
     Form(form): Form<ConfigureCloudflareForm>,
 ) -> Response {
-    if !valid_csrf(&state, &headers, &form.csrf) {
-        return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
+    if let Some(rejection) = require_csrf(&state, &headers, &form.csrf) {
+        return rejection;
     }
     match state
         .cloudflare
@@ -467,8 +467,8 @@ async fn create_binding(
     headers: HeaderMap,
     Form(form): Form<BindingForm>,
 ) -> Response {
-    if !valid_csrf(&state, &headers, &form.csrf) {
-        return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
+    if let Some(rejection) = require_csrf(&state, &headers, &form.csrf) {
+        return rejection;
     }
     let input = CreateBinding {
         hostname: form.hostname,
@@ -549,8 +549,8 @@ async fn update_binding(
     headers: HeaderMap,
     Form(form): Form<UpdateBindingForm>,
 ) -> Response {
-    if !valid_csrf(&state, &headers, &form.csrf) {
-        return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
+    if let Some(rejection) = require_csrf(&state, &headers, &form.csrf) {
+        return rejection;
     }
     match state
         .bindings
@@ -584,8 +584,8 @@ async fn remove_binding(
     headers: HeaderMap,
     Form(form): Form<CsrfForm>,
 ) -> Response {
-    if !valid_csrf(&state, &headers, &form.csrf) {
-        return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
+    if let Some(rejection) = require_csrf(&state, &headers, &form.csrf) {
+        return rejection;
     }
     match state.bindings.remove(&id).await {
         Ok(()) => Redirect::to("/").into_response(),
@@ -613,8 +613,14 @@ fn authenticated_csrf(store: &Store, headers: &HeaderMap) -> Option<String> {
     store.session_csrf(session).ok().flatten()
 }
 
-fn valid_csrf(state: &AdminState, headers: &HeaderMap, supplied: &str) -> bool {
+/// Guards a mutating request. Returns the failure response to send, or `None`
+/// when the request may proceed. A missing or expired session is not a CSRF
+/// problem — it redirects to the login page instead of a dead-end 403.
+fn require_csrf(state: &AdminState, headers: &HeaderMap, supplied: &str) -> Option<Response> {
     use subtle::ConstantTimeEq;
+    let Some(expected) = authenticated_csrf(&state.store, headers) else {
+        return Some(Redirect::to("/login").into_response());
+    };
     let origin_is_valid = match headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
@@ -639,10 +645,19 @@ fn valid_csrf(state: &AdminState, headers: &HeaderMap, supplied: &str) -> bool {
         Some(_) => false,
     };
     if !origin_is_valid {
-        return false;
+        return Some((StatusCode::FORBIDDEN, "Cross-origin request rejected").into_response());
     }
-    authenticated_csrf(&state.store, headers)
-        .is_some_and(|expected| bool::from(expected.as_bytes().ct_eq(supplied.as_bytes())))
+    if !bool::from(expected.as_bytes().ct_eq(supplied.as_bytes())) {
+        return Some(
+            (
+                StatusCode::FORBIDDEN,
+                "This form is stale (it was loaded under a previous session). \
+                 Go back, refresh the page, and try again.",
+            )
+                .into_response(),
+        );
+    }
+    None
 }
 
 fn login_is_throttled(state: &AdminState, peer_ip: IpAddr) -> bool {

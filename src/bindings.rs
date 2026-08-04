@@ -81,7 +81,12 @@ impl BindingManager {
             bail!("upstream scheme must be http or https");
         }
         if input.upstream_port == 0 || self.reserved_ports.contains(&input.upstream_port) {
-            bail!("upstream port is reserved by Hostknot");
+            bail!(
+                "port {} is one of Hostknot's own listeners (admin UI or proxy), so it cannot \
+                 be bound — the admin UI is always reached directly at https://<VPS-IP>:9443. \
+                 Bind the loopback port your application listens on instead.",
+                input.upstream_port
+            );
         }
         if self.public_ips.is_empty() {
             bail!("at least one public IP address is required");
@@ -162,7 +167,12 @@ impl BindingManager {
             bail!("upstream scheme must be http or https");
         }
         if input.upstream_port == 0 || self.reserved_ports.contains(&input.upstream_port) {
-            bail!("upstream port is reserved by Hostknot");
+            bail!(
+                "port {} is one of Hostknot's own listeners (admin UI or proxy), so it cannot \
+                 be bound — the admin UI is always reached directly at https://<VPS-IP>:9443. \
+                 Bind the loopback port your application listens on instead.",
+                input.upstream_port
+            );
         }
         let binding = self.store.binding(id)?.context("binding does not exist")?;
         if !matches!(binding.status.as_str(), "active" | "degraded") {
