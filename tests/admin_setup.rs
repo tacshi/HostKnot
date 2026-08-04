@@ -106,6 +106,24 @@ async fn bootstrap_token_creates_the_administrator_once() {
         .unwrap();
     assert_eq!(null_origin.status(), StatusCode::SEE_OTHER);
 
+    // Browsing the admin UI by an address that differs from the configured
+    // admin_public_url (NAT, alias, stale config) must still work: the
+    // origin check is self-consistent against the request's own Host.
+    let alias_origin = client
+        .post(format!("{base}/providers/cloudflare/configure"))
+        .header("origin", "http://vps-alias.example:9443")
+        .header("host", "vps-alias.example:9443")
+        .form(&[
+            ("csrf", csrf.as_str()),
+            ("client_id", "client"),
+            ("client_secret", "secret"),
+            ("scopes", "zone.read dns.write offline_access"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(alias_origin.status(), StatusCode::SEE_OTHER);
+
     // But a null origin that Sec-Fetch-Site positively marks as cross-site
     // is still rejected.
     let null_cross_site = client

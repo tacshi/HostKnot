@@ -118,6 +118,18 @@ pub fn install_systemd(options: InstallOptions<'_>) -> Result<()> {
         };
         fs::write(&config_path, toml::to_string_pretty(&config)?)?;
         set_mode(&config_path, 0o644)?;
+    } else if let Ok(existing) = FileConfig::load(&config_path)
+        && existing.public_ips != options.public_ips
+    {
+        // A stale address here silently breaks DNS records and the admin
+        // certificate; the operator must know reinstalls do not rewrite it.
+        eprintln!(
+            "WARNING: {} already exists and keeps its public IPs {:?}; --public-ip {:?} was NOT applied. \
+             Edit public_ips and admin_public_url in that file if the address changed, then restart.",
+            config_path.display(),
+            existing.public_ips,
+            options.public_ips,
+        );
     }
     fs::write(&unit_path, SYSTEMD_UNIT)?;
     set_mode(&unit_path, 0o644)?;

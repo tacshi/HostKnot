@@ -105,6 +105,14 @@ async fn attach_peer_ip(mut request: axum::extract::Request, next: Next) -> Resp
         .map(|peer| peer.ip())
         .unwrap_or(IpAddr::from([0, 0, 0, 0]));
     request.extensions_mut().insert(PeerIp(peer_ip));
+    // HTTP/2 requests carry the host in :authority, not a Host header;
+    // materialize it so header-based checks see it uniformly.
+    if !request.headers().contains_key(header::HOST)
+        && let Some(authority) = request.uri().authority()
+        && let Ok(value) = HeaderValue::from_str(authority.as_str())
+    {
+        request.headers_mut().insert(header::HOST, value);
+    }
     next.run(request).await
 }
 
@@ -601,6 +609,13 @@ impl HtmlStatus for Html<String> {
     }
 }
 
+fn origin_host(origin: &str) -> Option<String> {
+    origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+        .map(str::to_ascii_lowercase)
+}
+
 fn authenticated_csrf(store: &Store, headers: &HeaderMap) -> Option<String> {
     let session = cookie(headers, "hostknot_session")?;
     store.session_csrf(session).ok().flatten()
@@ -625,6 +640,21 @@ fn require_csrf(state: &AdminState, headers: &HeaderMap, supplied: &str) -> Opti
             .and_then(|value| value.to_str().ok())
             .is_none_or(|site| matches!(site, "same-origin" | "none")),
         Some(origin) if origin == state.expected_origin => true,
+        // Self-consistency, independent of any configured URL: a same-origin
+        // submission always has an Origin whose host equals the request's own
+        // Host, no matter which address the operator browses the VPS by. A
+        // forged cross-site POST cannot fake this — the browser pins Origin
+        // to the attacker's page.
+        Some(origin)
+            if origin_host(origin).is_some()
+                && origin_host(origin)
+                    == headers
+                        .get(header::HOST)
+                        .and_then(|value| value.to_str().ok())
+                        .map(|host| host.trim().to_ascii_lowercase()) =>
+        {
+            true
+        }
         // "null" is ambiguous, not proof of cross-origin: restrictive
         // referrer policies make browsers send it even for same-origin form
         // POSTs, and Safari may omit Sec-Fetch-* entirely. Only treat it as
