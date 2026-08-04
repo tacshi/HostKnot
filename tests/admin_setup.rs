@@ -89,6 +89,40 @@ async fn bootstrap_token_creates_the_administrator_once() {
         .unwrap();
     assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
 
+    // Safari with a restrictive referrer policy: same-origin form POSTs carry
+    // "Origin: null" and no Sec-Fetch-Site header. The CSRF token is the
+    // gate; a null origin alone must not reject the request.
+    let null_origin = client
+        .post(format!("{base}/providers/cloudflare/configure"))
+        .header("origin", "null")
+        .form(&[
+            ("csrf", csrf.as_str()),
+            ("client_id", "client"),
+            ("client_secret", "secret"),
+            ("scopes", "zone.read dns.write offline_access"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(null_origin.status(), StatusCode::SEE_OTHER);
+
+    // But a null origin that Sec-Fetch-Site positively marks as cross-site
+    // is still rejected.
+    let null_cross_site = client
+        .post(format!("{base}/providers/cloudflare/configure"))
+        .header("origin", "null")
+        .header("sec-fetch-site", "cross-site")
+        .form(&[
+            ("csrf", csrf.as_str()),
+            ("client_id", "client"),
+            ("client_secret", "secret"),
+            ("scopes", "zone.read dns.write offline_access"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(null_cross_site.status(), StatusCode::FORBIDDEN);
+
     let logout = client
         .post(format!("{base}/logout"))
         .form(&[("csrf", csrf.as_str())])

@@ -27,7 +27,6 @@ pub struct AdminState {
     cloudflare: Cloudflare,
     bindings: BindingManager,
     expected_origin: String,
-    expected_host: String,
     failed_logins: Mutex<HashMap<IpAddr, VecDeque<i64>>>,
     certificates: Arc<CertificateResolver>,
     clock: crate::Clock,
@@ -44,11 +43,6 @@ impl AdminState {
     ) -> anyhow::Result<Self> {
         let callback_url = public_url.join("oauth/cloudflare/callback")?;
         let expected_origin = public_url.origin().ascii_serialization();
-        let expected_host = expected_origin
-            .strip_prefix("https://")
-            .or_else(|| expected_origin.strip_prefix("http://"))
-            .unwrap_or(&expected_origin)
-            .to_owned();
         let cloudflare = Cloudflare::new(store.clone(), cloudflare_endpoints, callback_url)?;
         let clock = store.clock();
         Ok(Self {
@@ -57,7 +51,6 @@ impl AdminState {
             cloudflare,
             bindings,
             expected_origin,
-            expected_host,
             failed_logins: Mutex::new(HashMap::new()),
             certificates,
             clock,
@@ -632,16 +625,15 @@ fn require_csrf(state: &AdminState, headers: &HeaderMap, supplied: &str) -> Opti
             .and_then(|value| value.to_str().ok())
             .is_none_or(|site| matches!(site, "same-origin" | "none")),
         Some(origin) if origin == state.expected_origin => true,
-        Some("null") => {
-            headers
-                .get("sec-fetch-site")
-                .and_then(|value| value.to_str().ok())
-                == Some("same-origin")
-                && headers
-                    .get(header::HOST)
-                    .and_then(|value| value.to_str().ok())
-                    == Some(state.expected_host.as_str())
-        }
+        // "null" is ambiguous, not proof of cross-origin: restrictive
+        // referrer policies make browsers send it even for same-origin form
+        // POSTs, and Safari may omit Sec-Fetch-* entirely. Only treat it as
+        // cross-origin when Sec-Fetch-Site positively says so; the
+        // per-session CSRF token below remains the real gate.
+        Some("null") => headers
+            .get("sec-fetch-site")
+            .and_then(|value| value.to_str().ok())
+            .is_none_or(|site| matches!(site, "same-origin" | "none")),
         Some(_) => false,
     };
     if !origin_is_valid {
@@ -723,9 +715,13 @@ async fn security_headers(request: axum::extract::Request, next: Next) -> Respon
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    // same-origin, not no-referrer: a no-referrer policy makes browsers send
+    // "Origin: null" on same-origin form POSTs (Fetch spec), which broke the
+    // origin check for browsers that omit Sec-Fetch-* (Safari). same-origin
+    // still sends nothing cross-origin.
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
     headers.insert(
         header::HeaderName::from_static("permissions-policy"),
