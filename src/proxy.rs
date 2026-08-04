@@ -1,4 +1,7 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use axum::{
     Router,
@@ -146,7 +149,23 @@ async fn proxy_entry(
     }
     let websocket = is_websocket_upgrade(request.headers());
     let downstream_upgrade = websocket.then(|| hyper::upgrade::on(&mut request));
-    prepare_forward_headers(request.headers_mut(), peer, &hostname, "https", websocket);
+    // For Cloudflare-proxied bindings the TCP peer is a Cloudflare edge, and
+    // the real visitor is in CF-Connecting-IP. Trust that header ONLY when
+    // the peer verifiably belongs to Cloudflare's published ranges; from any
+    // other peer the header is an untrusted spoof and must not reach the app.
+    let trusted_cloudflare_hop = binding.proxied && is_cloudflare_ip(peer.ip());
+    if !trusted_cloudflare_hop {
+        request.headers_mut().remove("cf-connecting-ip");
+        request.headers_mut().remove("true-client-ip");
+    }
+    let client_ip = resolve_client_ip(peer.ip(), request.headers(), trusted_cloudflare_hop);
+    prepare_forward_headers(
+        request.headers_mut(),
+        client_ip,
+        &hostname,
+        "https",
+        websocket,
+    );
     let path = request
         .uri()
         .path_and_query()
@@ -297,7 +316,7 @@ fn request_hostname(request: &Request<Body>) -> Option<String> {
 
 fn prepare_forward_headers(
     headers: &mut HeaderMap,
-    peer: SocketAddr,
+    client_ip: IpAddr,
     hostname: &str,
     scheme: &str,
     preserve_upgrade: bool,
@@ -307,7 +326,7 @@ fn prepare_forward_headers(
     headers.remove("x-real-ip");
     headers.insert(
         HeaderName::from_static("x-forwarded-for"),
-        HeaderValue::from_str(&peer.ip().to_string()).expect("IP is a valid header value"),
+        HeaderValue::from_str(&client_ip.to_string()).expect("IP is a valid header value"),
     );
     headers.insert(
         HeaderName::from_static("x-forwarded-proto"),
@@ -317,11 +336,72 @@ fn prepare_forward_headers(
         HeaderName::from_static("x-forwarded-host"),
         HeaderValue::from_str(hostname).expect("hostname is a valid header value"),
     );
-    let forwarded = format!("for=\"{}\";proto={scheme};host=\"{hostname}\"", peer.ip());
+    let forwarded = format!("for=\"{client_ip}\";proto={scheme};host=\"{hostname}\"");
     headers.insert(
         HeaderName::from_static("forwarded"),
         HeaderValue::from_str(&forwarded).expect("Forwarded value is valid"),
     );
+}
+
+/// Cloudflare's published egress ranges (https://www.cloudflare.com/ips/).
+/// These change very rarely; refresh alongside dependency bumps.
+const CLOUDFLARE_RANGES: &[&str] = &[
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+];
+
+fn is_cloudflare_ip(ip: IpAddr) -> bool {
+    CLOUDFLARE_RANGES.iter().any(|range| {
+        let Some((network, prefix)) = range.split_once('/') else {
+            return false;
+        };
+        let Ok(prefix): Result<u32, _> = prefix.parse() else {
+            return false;
+        };
+        match (ip, network.parse::<IpAddr>()) {
+            (IpAddr::V4(ip), Ok(IpAddr::V4(network))) => {
+                prefix == 0 || (u32::from(ip) ^ u32::from(network)) >> (32 - prefix) == 0
+            }
+            (IpAddr::V6(ip), Ok(IpAddr::V6(network))) => {
+                prefix == 0 || (u128::from(ip) ^ u128::from(network)) >> (128 - prefix) == 0
+            }
+            _ => false,
+        }
+    })
+}
+
+/// The visitor address to report to the app: CF-Connecting-IP when the hop is
+/// a verified Cloudflare edge, otherwise the TCP peer.
+fn resolve_client_ip(peer: IpAddr, headers: &HeaderMap, trusted_cloudflare_hop: bool) -> IpAddr {
+    if trusted_cloudflare_hop
+        && let Some(client) = headers
+            .get("cf-connecting-ip")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<IpAddr>().ok())
+    {
+        return client;
+    }
+    peer
 }
 
 fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
@@ -379,5 +459,41 @@ fn permanent_redirect(location: &str) -> Response {
             response
         }
         Err(_) => StatusCode::BAD_REQUEST.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloudflare_ranges_match_edges_and_reject_others() {
+        // Addresses inside published Cloudflare ranges (v4 and v6).
+        assert!(is_cloudflare_ip("104.23.198.120".parse().unwrap()));
+        assert!(is_cloudflare_ip("172.71.0.1".parse().unwrap()));
+        assert!(is_cloudflare_ip("2606:4700::1".parse().unwrap()));
+        // Loopback, RFC1918, documentation, and arbitrary public space.
+        assert!(!is_cloudflare_ip("127.0.0.1".parse().unwrap()));
+        assert!(!is_cloudflare_ip("192.168.1.10".parse().unwrap()));
+        assert!(!is_cloudflare_ip("203.0.113.7".parse().unwrap()));
+        assert!(!is_cloudflare_ip("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn client_ip_uses_cf_header_only_over_a_trusted_hop() {
+        let peer: IpAddr = "104.23.198.120".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-connecting-ip", "198.51.100.7".parse().unwrap());
+        // Trusted Cloudflare hop: the header wins.
+        assert_eq!(
+            resolve_client_ip(peer, &headers, true),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+        // Untrusted hop: same header is ignored.
+        assert_eq!(resolve_client_ip(peer, &headers, false), peer);
+        // Garbage header falls back to the peer even when trusted.
+        let mut junk = HeaderMap::new();
+        junk.insert("cf-connecting-ip", "not-an-ip".parse().unwrap());
+        assert_eq!(resolve_client_ip(peer, &junk, true), peer);
     }
 }

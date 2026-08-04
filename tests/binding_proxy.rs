@@ -253,6 +253,7 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
         .get(format!("https://{}/hello", running.https_addr()))
         .header("host", "app.example.com")
         .header("x-forwarded-for", "spoofed")
+        .header("cf-connecting-ip", "6.6.6.6")
         .header("connection", "keep-alive, x-secret-hop")
         .header("x-secret-hop", "hidden")
         .send()
@@ -263,6 +264,9 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
     assert!(body.contains("host=app.example.com"));
     assert!(body.contains("proto=https"));
     assert!(!body.contains("spoofed"));
+    // A spoofed CF-Connecting-IP from a non-Cloudflare peer must neither be
+    // trusted for X-Forwarded-For nor reach the app.
+    assert!(!body.contains("6.6.6.6"));
     assert!(body.contains("secret=absent"));
 
     let streaming = proxy

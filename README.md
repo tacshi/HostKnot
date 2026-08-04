@@ -73,6 +73,7 @@ It looks like `https://<YOUR_VPS_IP>:9443/setup?token=...`. The token is single-
 - **Certificate hiccups don't dead-end.** If issuance is delayed (DNS propagation, a busy CA), the binding shows *Certificate pending* on the dashboard and retries in the background with backoff — no action needed.
 - **Conflicts need confirmation.** If the hostname already has A/AAAA/CNAME records, Hostknot shows exactly what it would replace, saves the originals, and restores them on unbind.
 - **Drift is never destroyed.** If someone changes the records outside Hostknot, unbinding stops and reports the drift instead of overwriting external changes; once resolved, removal completes automatically.
+- **Apps see the real visitor IP.** On Cloudflare-proxied bindings, Hostknot verifies the connection actually comes from Cloudflare's published ranges, then reports the visitor's address (from `CF-Connecting-IP`) in `X-Forwarded-For` and `Forwarded`. Spoofed copies of those headers on direct connections are stripped before reaching your app.
 - **Unbinding drains.** DNS records are removed first, then the route keeps serving for five minutes so cached DNS doesn't hit a dead endpoint.
 - **Everything survives restarts** — bindings, sessions, certificates, DNS receipts, and any half-finished work, which reconciliation resumes with backoff.
 
@@ -127,7 +128,7 @@ Reinstalls never touch an existing config, so a changed VPS address is a manual 
 - **Least privilege.** The systemd unit runs under a private dynamic user with `CAP_NET_BIND_SERVICE` as its only capability, a read-only host filesystem, and a writable state directory.
 - **Encrypted at rest.** OAuth secrets and tokens, ACME account credentials, and certificate keys are sealed with XChaCha20-Poly1305 under a mode-`0600` master key (context-bound so ciphertexts can't be swapped between columns). The service refuses to start if the key is readable by other users. Only Argon2id hashes are stored for the admin password.
 - **Hardened admin surface.** HTTPS with a trusted IP certificate, HTTP-only same-site session cookies, per-session CSRF tokens with origin checks, per-IP login throttling, expiring single-use setup/reset tokens, OAuth state bound to the initiating session (PKCE S256), and strict security headers.
-- **Contained proxying.** Upstreams are pinned to loopback — the proxy cannot be pointed at arbitrary hosts. Inbound `X-Forwarded-*` headers are overwritten, hop-by-hop headers are stripped, and upstream failures return an opaque 502. For HTTPS upstreams, private and self-signed certificates are accepted automatically: that hop never leaves the machine, while the public-facing side always serves real, verified certificates.
+- **Contained proxying.** Upstreams are pinned to loopback — the proxy cannot be pointed at arbitrary hosts. Inbound `X-Forwarded-*` headers are overwritten, hop-by-hop headers are stripped, and upstream failures return an opaque 502. For HTTPS upstreams, private and self-signed certificates are accepted automatically: that hop never leaves the machine, while the public-facing side always serves real, verified certificates. `CF-Connecting-IP` is honored only from verified Cloudflare edge addresses and stripped from everything else.
 
 ## Troubleshooting
 
