@@ -23,6 +23,15 @@ test("connect Cloudflare, bind, confirm replacement, and unbind", async ({ page 
   // open authorization automatically; the fake consent endpoint approves it
   // immediately and redirects back to the callback.
   await page.getByRole("link", { name: "Cloudflare" }).click();
+  const createOAuthClient = page.getByRole("link", {
+    name: "Create OAuth client in Cloudflare ↗",
+  });
+  await expect(createOAuthClient).toBeVisible();
+  await expect(createOAuthClient).toHaveAttribute(
+    "href",
+    "https://dash.cloudflare.com/?to=%2F%3Aaccount%2Foauth-clients"
+  );
+  await expect(createOAuthClient).toHaveAttribute("target", "_blank");
   await page.getByLabel("Client ID").fill("private-client-id");
   await page.getByLabel("Client secret").fill("private-client-secret");
   await page.getByRole("button", { name: "Save OAuth client" }).click();

@@ -324,21 +324,27 @@ async fn cloudflare_page(State(state): State<Arc<AdminState>>, headers: HeaderMa
     let Some(csrf) = authenticated_csrf(&state.store, &headers) else {
         return Redirect::to("/login").into_response();
     };
+    let configured = state.cloudflare.configured();
     let status = if state.cloudflare.connected() {
         format!(
             r#"<div class="status good"><strong>Connected</strong><span>Cloudflare can manage DNS records.</span></div><form class="inline" method="post" action="/providers/cloudflare/disconnect"><input type="hidden" name="csrf" value="{}"><button class="danger" type="submit">Disconnect</button></form>"#,
             escape_html(&csrf)
         )
-    } else if state.cloudflare.configured() {
+    } else if configured {
         r#"<div class="status"><strong>Configured</strong><span>Authorization is still required.</span></div><p><a class="button" href="/providers/cloudflare/connect">Authorize with Cloudflare</a></p>"#.to_owned()
     } else {
         r#"<div class="status"><strong>Not configured</strong><span>Create a private Cloudflare OAuth client first.</span></div>"#.to_owned()
+    };
+    let setup_action = if configured {
+        ""
+    } else {
+        r#"<p class="provider-actions"><a class="button" href="https://dash.cloudflare.com/?to=%2F%3Aaccount%2Foauth-clients" target="_blank" rel="noopener noreferrer">Create OAuth client in Cloudflare ↗</a></p>"#
     };
     let callback = escape_html(state.cloudflare.callback_url().as_str());
     Html(page(
         "Cloudflare",
         &format!(
-            r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">DNS PROVIDER</span><h1>Cloudflare</h1>{status}<section class="instructions"><h2>OAuth client settings</h2><p>Grant Zone Read, DNS Write, and offline access. Register this exact callback:</p><code>{callback}</code></section><form method="post" action="/providers/cloudflare/configure"><input type="hidden" name="csrf" value="{}"><label>Client ID<input name="client_id" required></label><label>Client secret<input name="client_secret" type="password" autocomplete="off" required></label><label>Scopes<input name="scopes" value="zone.read dns.write offline_access" required></label><button type="submit">Save OAuth client</button></form></main>"#,
+            r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">DNS PROVIDER</span><h1>Cloudflare</h1>{status}{setup_action}<section class="instructions"><h2>OAuth client settings</h2><p>Grant Zone Read, DNS Write, and offline access. Register this exact callback:</p><code>{callback}</code></section><form method="post" action="/providers/cloudflare/configure"><input type="hidden" name="csrf" value="{}"><label>Client ID<input name="client_id" required></label><label>Client secret<input name="client_secret" type="password" autocomplete="off" required></label><label>Scopes<input name="scopes" value="zone.read dns.write offline_access" required></label><button type="submit">Save OAuth client</button></form></main>"#,
             escape_html(&csrf)
         ),
     ))
@@ -925,6 +931,7 @@ form,.empty,.instructions,.status,.table,.events{margin-top:2rem;padding:28px;bo
 .inline{margin:0;padding:0;border:0;background:none;box-shadow:none}
 .status{display:flex;justify-content:space-between;gap:18px}
 .status span,small,.muted{display:block;color:var(--muted)}
+.provider-actions{margin:1rem 0 0}
 label{display:block;color:var(--muted);font-size:.875rem;margin-bottom:20px}
 input,select{width:100%;margin-top:7px;border:1px solid var(--line);border-radius:10px;background:#0d100e;color:var(--ink);font:inherit;padding:12px 14px;outline:none}
 .check{display:flex;align-items:center;gap:10px}

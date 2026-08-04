@@ -3,7 +3,7 @@
 Hostknot uses a private Cloudflare Authorization Code OAuth client with server-side client authentication, PKCE S256, state validation, refresh-token rotation, and an exact callback URI.
 
 1. Open the Hostknot Cloudflare page. Keep it open: it displays the exact callback URI for this VPS.
-2. In the Cloudflare dashboard, create a private OAuth client.
+2. Select **Create OAuth client in Cloudflare** to open the account's OAuth Clients page, then create a private client.
 3. Add that callback URI exactly, including `https`, the IP literal, port `9443`, and `/oauth/cloudflare/callback`.
 4. Grant Zone Read, DNS Write, and offline access.
 5. Save the client, then enter its ID and secret in Hostknot.

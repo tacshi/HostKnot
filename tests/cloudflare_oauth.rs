@@ -250,6 +250,11 @@ async fn cloudflare_oauth_uses_pkce_and_rejects_callback_replay() {
         .unwrap();
     let csrf = hidden_value(&provider_page, "csrf");
     assert!(provider_page.contains("/oauth/cloudflare/callback"));
+    assert!(
+        provider_page
+            .contains(r#"href="https://dash.cloudflare.com/?to=%2F%3Aaccount%2Foauth-clients""#)
+    );
+    assert!(provider_page.contains("Create OAuth client in Cloudflare ↗"));
 
     let configured = client
         .post(format!("{base}/providers/cloudflare/configure"))
