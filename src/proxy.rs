@@ -164,7 +164,10 @@ async fn proxy_entry(
     *request.uri_mut() = upstream_uri;
     // Downstream h2 requests must not force h2 on the loopback connection.
     *request.version_mut() = axum::http::Version::HTTP_11;
-    let client = if binding.upstream_scheme == "https" && binding.insecure_tls {
+    // HTTPS upstreams are pinned to loopback by the connector. Hostknot owns
+    // the public certificate, so a private/self-signed certificate on this
+    // local-only hop must not require operator configuration.
+    let client = if binding.upstream_scheme == "https" {
         &state.insecure_client
     } else {
         &state.client
@@ -205,12 +208,18 @@ async fn proxy_entry(
         }
         Err(error) => {
             tracing::warn!(hostname, %error, "upstream request failed");
-            if binding.health != "unavailable"
-                && let Err(store_error) = state.store.update_binding_health(
-                    &binding.id,
-                    false,
-                    Some("loopback upstream is unavailable"),
-                )
+            let health_error = if binding.upstream_scheme == "https" {
+                "HTTPS upstream failed. Verify the local service actually uses HTTPS on this \
+                 port; Hostknot already accepts its private/self-signed certificate."
+            } else {
+                "HTTP upstream failed. Verify the local service is running on this port."
+            };
+            if (binding.health != "unavailable"
+                || binding.last_error.as_deref() != Some(health_error))
+                && let Err(store_error) =
+                    state
+                        .store
+                        .update_binding_health(&binding.id, false, Some(health_error))
             {
                 tracing::debug!(%store_error, "failed to persist upstream failure");
             }

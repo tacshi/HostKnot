@@ -154,17 +154,36 @@ async fn index(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Resp
                 } else {
                     title_status(&binding.health)
                 };
+                let health_error = if binding.status == "degraded" {
+                    binding
+                        .last_error
+                        .as_deref()
+                        .map(|error| {
+                            format!(
+                                r#"<small class="health-error">{}</small>"#,
+                                escape_html(error)
+                            )
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 let certificate = if draining {
                     "Retained during drain".to_owned()
                 } else {
-                    format!(
-                        "{}<small>{}</small>",
-                        title_status(&binding.certificate_status),
+                    let error = if binding.status == "degraded" {
+                        String::new()
+                    } else {
                         binding
                             .last_error
                             .as_deref()
                             .map(escape_html)
                             .unwrap_or_default()
+                    };
+                    format!(
+                        "{}<small>{}</small>",
+                        title_status(&binding.certificate_status),
+                        error
                     )
                 };
                 let dns = if draining {
@@ -178,14 +197,14 @@ async fn index(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Resp
                     r#"<span class="muted">Removal in progress</span>"#.to_owned()
                 } else {
                     format!(
-                        r#"<a href="/bindings/{}/edit">Edit</a><form class="inline" method="post" action="/bindings/{}/remove"><input type="hidden" name="csrf" value="{}"><button class="danger" type="submit">Unbind</button></form>"#,
+                        r#"<div class="row-actions"><a class="button secondary" href="/bindings/{}/edit">Edit</a><form class="inline" method="post" action="/bindings/{}/remove"><input type="hidden" name="csrf" value="{}"><button class="danger" type="submit">Unbind</button></form></div>"#,
                         binding.id,
                         binding.id,
                         escape_html(&csrf)
                     )
                 };
                 format!(
-                    r#"<tr data-binding-id="{}"><td data-label="Hostname"><strong>{}</strong></td><td data-label="Upstream"><code class="upstream">{}://127.0.0.1:{}</code></td><td data-label="Status / health"><span class="pill {}">{}</span><small>{}</small></td><td data-label="Certificate">{}</td><td data-label="DNS">{}</td><td class="actions" data-label="Actions">{}</td></tr>"#,
+                    r#"<tr data-binding-id="{}"><td data-label="Hostname"><strong>{}</strong></td><td data-label="Upstream"><code class="upstream">{}://127.0.0.1:{}</code></td><td data-label="Status / health"><span class="pill {}">{}</span><small>{}</small>{}</td><td data-label="Certificate">{}</td><td data-label="DNS">{}</td><td class="actions" data-label="Actions">{}</td></tr>"#,
                     binding.id,
                     escape_html(&binding.hostname),
                     binding.upstream_scheme,
@@ -193,6 +212,7 @@ async fn index(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Resp
                     binding.status,
                     title_status(&binding.status),
                     health,
+                    health_error,
                     certificate,
                     dns,
                     actions
@@ -340,28 +360,34 @@ async fn cloudflare_page(State(state): State<Arc<AdminState>>, headers: HeaderMa
         return Redirect::to("/login").into_response();
     };
     let configured = state.cloudflare.configured();
-    let status = if state.cloudflare.connected() {
+    let connected = state.cloudflare.connected();
+    let status = if connected {
         format!(
             r#"<div class="status good"><strong>Connected</strong><span>Cloudflare can manage DNS records.</span></div><form class="inline" method="post" action="/providers/cloudflare/disconnect"><input type="hidden" name="csrf" value="{}"><button class="danger" type="submit">Disconnect</button></form>"#,
             escape_html(&csrf)
         )
     } else if configured {
-        r#"<div class="status"><strong>Configured</strong><span>Authorization is still required.</span></div><p><a class="button" href="/providers/cloudflare/connect">Authorize with Cloudflare</a></p>"#.to_owned()
+        r#"<div class="status"><strong>OAuth client saved</strong><span>Authorize Cloudflare to finish connecting.</span></div>"#.to_owned()
     } else {
         r#"<div class="status"><strong>Not configured</strong><span>Create a private Cloudflare OAuth client first.</span></div>"#.to_owned()
     };
-    let setup_action = if configured {
-        ""
-    } else {
-        r#"<p class="provider-actions"><a class="button" href="https://dash.cloudflare.com/?to=%2F%3Aaccount%2Foauth-clients" target="_blank" rel="noopener noreferrer">Create OAuth client in Cloudflare ↗</a></p>"#
-    };
     let callback = escape_html(state.cloudflare.callback_url().as_str());
+    let flow = if connected {
+        String::new()
+    } else if configured {
+        format!(
+            r#"<section class="instructions next-step"><span class="step-label">STEP 3 · CLOUDFLARE</span><h2>Authorize Cloudflare</h2><p>Open Cloudflare, review the requested DNS permissions, and approve access.</p><a class="button" href="/providers/cloudflare/connect">Authorize with Cloudflare</a></section><details class="reconfigure"><summary>Change OAuth client credentials</summary><form method="post" action="/providers/cloudflare/configure"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="scopes" value="zone.read dns.write offline_access"><h2>Replace saved credentials</h2><label>Client ID<input name="client_id" required></label><label>Client secret<input name="client_secret" type="password" autocomplete="off" required></label><button type="submit">Save OAuth client</button></form></details>"#,
+            escape_html(&csrf)
+        )
+    } else {
+        format!(
+            r#"<p class="provider-actions"><a class="button" href="https://dash.cloudflare.com/?to=%2F%3Aaccount%2Foauth-clients" target="_blank" rel="noopener noreferrer">Create OAuth client in Cloudflare ↗</a></p><section class="instructions"><span class="step-label">STEP 1 · CLOUDFLARE</span><h2>Use these OAuth settings</h2><p>Enter these values on Cloudflare's <strong>Configure OAuth client</strong> screen.</p><dl class="oauth-settings"><div><dt>Client name</dt><dd>Hostknot</dd></div><div><dt>Response type</dt><dd>Code</dd></div><div><dt>Grant types</dt><dd>Authorization Code + Refresh Token</dd></div><div><dt>Token authentication</dt><dd>Client Secret Basic</dd></div><div class="wide"><dt>Redirect (Callback) URL</dt><dd><code>{callback}</code></dd></div></dl><p><strong>After Continue:</strong> select <strong>Zone · Read</strong> and <strong>DNS · Edit</strong>. Keep the client <strong>Private</strong> and leave Client URL blank. Cloudflare's “Client URL required” badge only matters if you later make the client public.</p></section><form method="post" action="/providers/cloudflare/configure"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="scopes" value="zone.read dns.write offline_access"><span class="step-label">STEP 2 · HOSTKNOT</span><h2>Paste the generated credentials</h2><p>Cloudflare shows the client secret once. Copy both values before leaving the page.</p><label>Client ID<input name="client_id" required></label><label>Client secret<input name="client_secret" type="password" autocomplete="off" required></label><button type="submit">Save OAuth client</button></form>"#,
+            escape_html(&csrf)
+        )
+    };
     Html(page(
         "Cloudflare",
-        &format!(
-            r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">DNS PROVIDER</span><h1>Cloudflare</h1>{status}{setup_action}<section class="instructions"><span class="step-label">STEP 1 · CLOUDFLARE</span><h2>Use these OAuth settings</h2><p>Enter these values on Cloudflare's <strong>Configure OAuth client</strong> screen.</p><dl class="oauth-settings"><div><dt>Client name</dt><dd>Hostknot</dd></div><div><dt>Response type</dt><dd>Code</dd></div><div><dt>Grant types</dt><dd>Authorization Code + Refresh Token</dd></div><div><dt>Token authentication</dt><dd>Client Secret Basic</dd></div><div class="wide"><dt>Redirect (Callback) URL</dt><dd><code>{callback}</code></dd></div></dl><p><strong>After Continue:</strong> select <strong>Zone · Read</strong> and <strong>DNS · Write</strong>. Leave Client URL blank and Advanced options unchanged.</p></section><form method="post" action="/providers/cloudflare/configure"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="scopes" value="zone.read dns.write offline_access"><span class="step-label">STEP 2 · HOSTKNOT</span><h2>Paste the generated credentials</h2><p>Cloudflare shows the client secret once. Copy both values before leaving the page.</p><label>Client ID<input name="client_id" required></label><label>Client secret<input name="client_secret" type="password" autocomplete="off" required></label><button type="submit">Save OAuth client</button></form></main>"#,
-            escape_html(&csrf)
-        ),
+        &format!(r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">DNS PROVIDER</span><h1>Cloudflare</h1>{status}{flow}</main>"#),
     ))
     .into_response()
 }
@@ -521,7 +547,7 @@ async fn new_binding_page(State(state): State<Arc<AdminState>>, headers: HeaderM
     Html(page(
         "New binding",
         &format!(
-            r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">NEW ROUTE</span><h1>Bind a domain</h1><form method="post" action="/bindings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="replace_existing" value="false"><label>Hostname<input name="hostname" placeholder="app.example.com" required></label><label>Upstream protocol<select name="upstream_scheme"><option value="https" selected>HTTPS</option><option value="http">HTTP</option></select></label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" list="ports" required><datalist id="ports">{ports}</datalist></label><label class="check"><input name="proxied" type="checkbox" value="true" checked> Enable Cloudflare proxy</label><label class="check"><input name="insecure_tls" type="checkbox" value="true"> Allow an untrusted HTTPS upstream certificate</label><button type="submit">Bind domain</button></form></main>"#,
+            r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">NEW ROUTE</span><h1>Bind a domain</h1><form method="post" action="/bindings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="replace_existing" value="false"><div class="managed-tls"><strong>Public HTTPS included</strong><span>Hostknot obtains and renews the domain certificate automatically.</span></div><label>Hostname<input name="hostname" placeholder="app.example.com" required></label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" list="ports" required><datalist id="ports">{ports}</datalist></label><details class="local-options"><summary>Local connection options</summary><label>Local service protocol<select name="upstream_scheme"><option value="http" selected>HTTP</option><option value="https">HTTPS</option></select><small class="form-help">Use HTTPS only when the local service itself requires it. Private and self-signed loopback certificates are accepted automatically.</small></label></details><label class="check"><input name="proxied" type="checkbox" value="true" checked> Enable Cloudflare proxy</label><button type="submit">Bind domain</button></form></main>"#,
             escape_html(&csrf)
         ),
     ))
@@ -604,11 +630,10 @@ async fn edit_binding_page(
         ""
     };
     let proxied = if binding.proxied { " checked" } else { "" };
-    let insecure = if binding.insecure_tls { " checked" } else { "" };
     Html(page(
         "Edit binding",
         &format!(
-            r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">EDIT ROUTE</span><h1>{}</h1><p>Hostnames are immutable. Create a replacement binding to use a different hostname.</p><form method="post" action="/bindings/{}"><input type="hidden" name="csrf" value="{}"><label>Upstream protocol<select name="upstream_scheme"><option value="http"{http_selected}>HTTP</option><option value="https"{https_selected}>HTTPS</option></select></label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" value="{}" required></label><label class="check"><input name="proxied" type="checkbox" value="true"{proxied}> Enable Cloudflare proxy</label><label class="check"><input name="insecure_tls" type="checkbox" value="true"{insecure}> Allow an untrusted HTTPS upstream certificate</label><button type="submit">Save changes</button></form></main>"#,
+            r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">EDIT ROUTE</span><h1>{}</h1><p>Hostnames are immutable. Create a replacement binding to use a different hostname.</p><form method="post" action="/bindings/{}"><input type="hidden" name="csrf" value="{}"><div class="managed-tls"><strong>Public HTTPS is automatic</strong><span>These settings only control the connection to the local service.</span></div><label>Local service protocol<select name="upstream_scheme"><option value="http"{http_selected}>HTTP</option><option value="https"{https_selected}>HTTPS</option></select><small class="form-help">Private and self-signed loopback certificates are accepted automatically.</small></label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" value="{}" required></label><label class="check"><input name="proxied" type="checkbox" value="true"{proxied}> Enable Cloudflare proxy</label><button type="submit">Save changes</button></form></main>"#,
             escape_html(&binding.hostname),
             binding.id,
             escape_html(&csrf),
@@ -946,7 +971,18 @@ form,.empty,.instructions,.status,.table,.events{margin-top:2rem;padding:28px;bo
 .inline{margin:0;padding:0;border:0;background:none;box-shadow:none}
 .status{display:flex;justify-content:space-between;gap:18px}
 .status span,small,.muted{display:block;color:var(--muted)}
+.form-help{margin-top:7px}
+.health-error{margin-top:5px;color:#ffb4a9}
+.managed-tls{display:flex;flex-direction:column;gap:3px;margin-bottom:22px;padding:14px 16px;border:1px solid #65d68b66;border-radius:12px;background:#112219}
+.managed-tls span{color:var(--muted);font-size:.875rem}
+.local-options{margin:-2px 0 20px;color:var(--muted)}
+.local-options summary{width:max-content;max-width:100%;cursor:pointer;color:var(--accent)}
+.local-options label{margin:16px 0 0}
 .provider-actions{margin:1rem 0 0}
+.next-step .button{margin-top:6px}
+.reconfigure{margin-top:18px;color:var(--muted)}
+.reconfigure summary{width:max-content;max-width:100%;cursor:pointer;color:var(--accent)}
+.reconfigure form{margin-top:14px}
 .step-label{display:block;margin-bottom:8px;color:var(--accent);font-size:.7rem;font-weight:800;letter-spacing:.14em}
 .oauth-settings{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;margin:20px 0;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--line)}
 .oauth-settings>div{min-width:0;padding:14px 16px;background:#0d100e}
@@ -959,7 +995,8 @@ input,select{width:100%;margin-top:7px;border:1px solid var(--line);border-radiu
 .check{display:flex;align-items:center;gap:10px}
 .check input{width:auto;margin:0}
 input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px #a7f3c322}
-button,.button{display:inline-block;border:0;border-radius:999px;background:var(--accent);color:#102117;font:inherit;font-weight:800;padding:12px 20px;cursor:pointer;text-decoration:none}
+button,.button{display:inline-block;border:0;border-radius:999px;background:var(--accent);color:#102117;font:inherit;font-weight:800;padding:12px 20px;cursor:pointer;text-decoration:none;white-space:nowrap}
+.secondary{border:1px solid var(--line);background:transparent;color:var(--accent)}
 .danger{background:#ffb4a9;color:#3b0a06}
 code{overflow-wrap:anywhere;background:#0b0e0c;padding:6px 9px;border-radius:8px;color:#d6ffe5}
 code.upstream{display:inline-block;max-width:100%;overflow-x:auto;overflow-wrap:normal;white-space:nowrap}
@@ -968,7 +1005,9 @@ table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:14px;border-bottom:1px solid var(--line)}
 th{color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.1em}
 .actions{white-space:nowrap}
-.actions .inline{margin-top:10px}
+.actions .inline{margin:0}
+.row-actions{display:flex;align-items:center;gap:10px;flex-wrap:nowrap}
+.row-actions button,.row-actions .button{padding:10px 16px}
 .pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:3px 10px}
 .pill.active{border-color:#65d68b;color:var(--accent)}
 @media(max-width:1100px){
@@ -980,7 +1019,7 @@ th{color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.
   .table td{display:block;min-width:0;padding:0;border:0}
   .table td::before{content:attr(data-label);display:block;margin-bottom:7px;color:var(--muted);font-size:.75rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase}
   .table .actions{grid-column:1/-1;white-space:normal}
-  .table .actions .inline{display:inline-block;margin:0 0 0 12px}
+  .table .actions .inline{margin:0}
 }
 @media(max-width:900px){
   header{align-items:flex-start;flex-direction:column}

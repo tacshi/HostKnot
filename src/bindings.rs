@@ -282,18 +282,6 @@ impl BindingManager {
                         None => self.finish_removal(&binding.id, &binding.hostname)?,
                     }
                 }
-                "degraded" => {
-                    // Without an active probe, a degraded binding that
-                    // receives no traffic would stay degraded forever.
-                    let probe = tokio::time::timeout(
-                        Duration::from_secs(2),
-                        tokio::net::TcpStream::connect(("127.0.0.1", binding.upstream_port)),
-                    )
-                    .await;
-                    if matches!(probe, Ok(Ok(_))) {
-                        self.store.update_binding_health(&binding.id, true, None)?;
-                    }
-                }
                 _ => {}
             }
         }
@@ -363,6 +351,7 @@ mod tests {
         provider::InMemoryDnsProvider,
         store::Store,
     };
+    use tokio::io::AsyncWriteExt;
 
     fn manager(store: &Store, drain: Duration) -> BindingManager {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -412,5 +401,37 @@ mod tests {
             .await
             .expect("a binding stuck in dns_pending must still be removable");
         assert_deleted_soon(&store, "b1", "receipt-less binding was never deleted").await;
+    }
+
+    #[tokio::test]
+    async fn degraded_https_binding_is_not_healed_by_a_plain_http_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .create_binding("b1", "app.example.com", "https", port, false, false, false)
+            .unwrap();
+        store.mark_binding_active("b1").unwrap();
+        store
+            .update_binding_health("b1", false, Some("HTTPS upstream connection failed"))
+            .unwrap();
+
+        manager(&store, Duration::from_secs(300))
+            .reconcile_once()
+            .await
+            .unwrap();
+
+        let binding = store.binding("b1").unwrap().unwrap();
+        assert_eq!(binding.status, "degraded");
+        assert_eq!(binding.health, "unavailable");
+        server.abort();
     }
 }

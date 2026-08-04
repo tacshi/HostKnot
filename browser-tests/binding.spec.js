@@ -39,19 +39,42 @@ test("connect Cloudflare, bind, confirm replacement, and unbind", async ({ page 
   await expect(
     page.getByText("Client Secret Basic", { exact: true })
   ).toBeVisible();
+  await expect(page.getByText("DNS · Edit", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Client URL required/)).toBeVisible();
+  await expect(page.locator('input[name="scopes"]')).toHaveValue(
+    "zone.read dns.write offline_access"
+  );
   await page.getByLabel("Client ID").fill("private-client-id");
   await page.getByLabel("Client secret").fill("private-client-secret");
   await page.getByRole("button", { name: "Save OAuth client" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Authorize Cloudflare" })
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Use these OAuth settings" })
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("heading", { name: "Paste the generated credentials" })
+  ).toHaveCount(0);
+  await expect(page.getByLabel("Client ID")).not.toBeVisible();
+  await expect(page.getByText("Change OAuth client credentials")).toBeVisible();
 
   // Submit a clean hostname to the live loopback upstream, follow the OAuth
   // round trip, then let reconciliation finish the pending binding.
   await page.goto(`${fixture.baseUrl}/bindings/new`);
-  await expect(page.getByLabel("Upstream protocol")).toHaveValue("https");
-  await page.getByLabel("Upstream protocol").selectOption("http");
+  await expect(page.getByText("Public HTTPS included")).toBeVisible();
+  await expect(page.getByLabel("Local service protocol")).toHaveValue("http");
+  await expect(
+    page.getByText("Allow an untrusted HTTPS upstream certificate")
+  ).toHaveCount(0);
   await page.getByLabel("Hostname").fill("app.example.com");
   await page.getByLabel("Local port").fill(String(fixture.upstreamPort));
   await page.getByRole("button", { name: "Bind domain" }).click();
   await expect(page.getByText("Connected", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Authorize Cloudflare" })
+  ).toHaveCount(0);
+  await expect(page.getByText("Change OAuth client credentials")).toHaveCount(0);
   await page.goto(fixture.baseUrl);
   const appRow = page
     .locator("tr[data-binding-id]")
@@ -60,6 +83,9 @@ test("connect Cloudflare, bind, confirm replacement, and unbind", async ({ page 
     await page.goto(fixture.baseUrl);
     await expect(appRow.locator(".pill.active")).toBeVisible();
   }).toPass({ timeout: 15_000 });
+  const rowActions = appRow.locator(".row-actions");
+  await expect(rowActions).toHaveCSS("display", "flex");
+  await expect(rowActions).toHaveCSS("flex-wrap", "nowrap");
 
   // At the reported 1024px viewport, six table columns are too cramped. Use
   // the labeled card layout before status and certificate copy starts wrapping.
@@ -82,7 +108,6 @@ test("connect Cloudflare, bind, confirm replacement, and unbind", async ({ page 
   // A hostname with pre-existing records goes through the confirmation
   // interstitial before anything is replaced.
   await page.goto(`${fixture.baseUrl}/bindings/new`);
-  await page.getByLabel("Upstream protocol").selectOption("http");
   await page.getByLabel("Hostname").fill("conflict.example.com");
   await page.getByLabel("Local port").fill(String(fixture.upstreamPort));
   await page.getByRole("button", { name: "Bind domain" }).click();

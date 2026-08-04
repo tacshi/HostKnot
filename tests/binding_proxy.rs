@@ -335,7 +335,7 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
         "secure.example.com",
         "https",
         https_upstream_port,
-        true,
+        false,
     )
     .await;
     let secure = proxy
@@ -377,6 +377,7 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
         .unwrap();
     assert!(status_page.contains("Healthy"));
     assert!(status_page.contains("Degraded"));
+    assert!(status_page.contains("HTTP upstream failed"));
     assert!(status_page.contains("Binding activated"));
 
     let request = format!("wss://{}/ws", running.https_addr())

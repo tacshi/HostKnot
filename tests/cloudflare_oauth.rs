@@ -269,6 +269,19 @@ async fn cloudflare_oauth_uses_pkce_and_rejects_callback_replay() {
         .unwrap();
     assert_eq!(configured.status(), StatusCode::SEE_OTHER);
 
+    let configured_page = client
+        .get(format!("{base}/providers/cloudflare"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(configured_page.contains("Authorize Cloudflare"));
+    assert!(configured_page.contains("Change OAuth client credentials"));
+    assert!(!configured_page.contains("Use these OAuth settings"));
+    assert!(!configured_page.contains("Paste the generated credentials"));
+
     let cancelled_connect = client
         .get(format!("{base}/providers/cloudflare/connect"))
         .send()
