@@ -1,8 +1,8 @@
-# Hostknot
+# HostKnot
 
 **Bind a domain to any service on your VPS from your browser — no Nginx, no Caddy, no config files to hand-edit.**
 
-Hostknot is a single Rust binary that turns "I deployed a service on port 3000, now I want `app.example.com` pointing at it with HTTPS" into a two-minute browser workflow. It combines four things that normally require separate tools:
+HostKnot is a single Rust binary that turns "I deployed a service on port 3000, now I want `app.example.com` pointing at it with HTTPS" into a two-minute browser workflow. It combines four things that normally require separate tools:
 
 - **A reverse proxy** on ports 80/443 with exact-host routing, HTTP/2, WebSockets, server-sent events, and streaming.
 - **Automatic DNS** through your Cloudflare account (OAuth-authorized, no API token pasting), with safe conflict handling and rollback on unbind.
@@ -19,7 +19,7 @@ Browser ──▶ https://<VPS-IP>:9443  (admin UI: bind app.example.com → :30
                     ├─▶ Cloudflare API   creates A/AAAA records (OAuth)
                     └─▶ Let's Encrypt    issues the certificate (HTTP-01)
 
-Visitors ─▶ https://app.example.com ──▶ Hostknot :443 ──▶ 127.0.0.1:3000
+Visitors ─▶ https://app.example.com ──▶ HostKnot :443 ──▶ 127.0.0.1:3000
 ```
 
 ## Requirements
@@ -53,27 +53,27 @@ systemctl daemon-reload && systemctl enable --now hostknot
 journalctl -u hostknot | grep 'setup URL'
 ```
 
-It looks like `https://<YOUR_VPS_IP>:9443/setup?token=...`. The token is single-use and expires after one hour — restart the service or run `hostknot admin reset` for a fresh one. Before the URL appears, Hostknot obtains a trusted Let's Encrypt IP certificate over HTTP-01, so port 80 must already be reachable; if issuance fails, the UI still comes up on a self-signed fallback and keeps retrying.
+It looks like `https://<YOUR_VPS_IP>:9443/setup?token=...`. The token is single-use and expires after one hour — restart the service or run `hostknot admin reset` for a fresh one. Before the URL appears, HostKnot obtains a trusted Let's Encrypt IP certificate over HTTP-01, so port 80 must already be reachable; if issuance fails, the UI still comes up on a self-signed fallback and keeps retrying.
 
 **3. Create the administrator.** Open the URL, set an admin password (12+ characters) and an ACME contact email.
 
 **4. Connect Cloudflare.** On the Cloudflare page in the UI:
    1. Create a **private** Authorization Code OAuth client in the Cloudflare dashboard.
    2. Register the exact callback URI the page displays, and grant **Zone Read**, **DNS Write**, and **offline access**.
-   3. Paste the client ID and secret into Hostknot, then click **Authorize with Cloudflare**.
+   3. Paste the client ID and secret into HostKnot, then click **Authorize with Cloudflare**.
 
    Full walkthrough: [docs/cloudflare-oauth.md](docs/cloudflare-oauth.md).
 
-**5. Bind a domain.** Click **New binding**, pick a discovered local port (or type one), enter the hostname, and bind. Hostknot creates the DNS records, obtains the certificate, and starts routing — typically within seconds. Most local apps speak plain HTTP; leave the protocol on its HTTP default and Hostknot still serves the public side over HTTPS.
+**5. Bind a domain.** Click **New binding**, pick a discovered local port (or type one), enter the hostname, and bind. HostKnot creates the DNS records, obtains the certificate, and starts routing — typically within seconds. Most local apps speak plain HTTP; leave the protocol on its HTTP default and HostKnot still serves the public side over HTTPS.
 
 ## What to expect from bindings
 
 - **Exact hostnames only.** `app.example.com` matches `app.example.com` — no wildcards, no path routing. Hostnames are immutable; to rename, create a replacement binding.
 - **Editable after creation:** the local port and protocol, and the Cloudflare proxied/DNS-only mode.
 - **Certificate hiccups don't dead-end.** If issuance is delayed (DNS propagation, a busy CA), the binding shows *Certificate pending* on the dashboard and retries in the background with backoff — no action needed.
-- **Conflicts need confirmation.** If the hostname already has A/AAAA/CNAME records, Hostknot shows exactly what it would replace, saves the originals, and restores them on unbind.
-- **Drift is never destroyed.** If someone changes the records outside Hostknot, unbinding stops and reports the drift instead of overwriting external changes; once resolved, removal completes automatically.
-- **Apps see the real visitor IP.** On Cloudflare-proxied bindings, Hostknot verifies the connection actually comes from Cloudflare's published ranges, then reports the visitor's address (from `CF-Connecting-IP`) in `X-Forwarded-For` and `Forwarded`. Spoofed copies of those headers on direct connections are stripped before reaching your app.
+- **Conflicts need confirmation.** If the hostname already has A/AAAA/CNAME records, HostKnot asks before replacing them, saves the originals, and restores them on unbind.
+- **Drift is never destroyed.** If someone changes the records outside HostKnot, unbinding stops and reports the drift instead of overwriting external changes; once resolved, removal completes automatically.
+- **Apps see the real visitor IP.** On Cloudflare-proxied bindings, HostKnot verifies the connection actually comes from Cloudflare's published ranges, then reports the visitor's address (from `CF-Connecting-IP`) in `X-Forwarded-For` and `Forwarded`. Spoofed copies of those headers on direct connections are stripped before reaching your app.
 - **Unbinding drains.** DNS records are removed first, then the route keeps serving for five minutes so cached DNS doesn't hit a dead endpoint.
 - **Everything survives restarts** — bindings, sessions, certificates, DNS receipts, and any half-finished work, which reconciliation resumes with backoff.
 
@@ -155,9 +155,9 @@ cargo test --all-targets
 cargo build --release
 ```
 
-The test suite runs against real seams: actual Hostknot processes, real HTTP/TLS/WebSocket clients, and protocol-level fakes for Cloudflare and ACME. Time-based behavior (token/session expiry, throttling, certificate renewal) is tested through an injected clock.
+The test suite runs against real seams: actual HostKnot processes, real HTTP/TLS/WebSocket clients, and protocol-level fakes for Cloudflare and ACME. Time-based behavior (token/session expiry, throttling, certificate renewal) is tested through an injected clock.
 
-Browser tests (Playwright, drives a real Hostknot process through setup, OAuth, binding, and unbind):
+Browser tests (Playwright, drives a real HostKnot process through setup, OAuth, binding, and unbind):
 
 ```sh
 npm ci && npx playwright install chromium

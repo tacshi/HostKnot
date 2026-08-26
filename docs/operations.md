@@ -1,4 +1,4 @@
-# Hostknot operations
+# HostKnot operations
 
 ## Before installation
 
@@ -22,7 +22,7 @@ Store that directory in an encrypted backup system. If online backup is required
 
 ## Restore
 
-Install the same or a newer Hostknot binary, stop the service, restore `config.toml`, `master.key`, and `hostknot.sqlite3` to their original paths, enforce mode `0600` on the key and `0700` on the state directory, then start the service. Run `hostknot doctor` and inspect the event history. Hostknot reloads certificates and resumes pending certificate, DNS, and drain states.
+Install the same or a newer HostKnot binary, stop the service, restore `config.toml`, `master.key`, and `hostknot.sqlite3` to their original paths, enforce mode `0600` on the key and `0700` on the state directory, then start the service. Run `hostknot doctor` and inspect the event history. HostKnot reloads certificates and resumes pending certificate, DNS update, removal, and drain states.
 
 ## Upgrade and migrations
 
@@ -31,14 +31,14 @@ Install the same or a newer Hostknot binary, stop the service, restore `config.t
 3. Run `hostknot service install --public-ip <current-IP> --binary ./hostknot`.
 4. Restart the service, then confirm the upgrade took effect with `hostknot version` and run `hostknot doctor`.
 
-Schema migrations are transactional and forward-only. Do not start an older Hostknot binary against a database already opened by a newer major/minor release unless its release notes explicitly permit downgrade.
+Schema migrations are transactional and forward-only. Do not start an older HostKnot binary against a database already opened by a newer major/minor release unless its release notes explicitly permit downgrade.
 
 ## Failure behavior
 
 - **Port 80/public IP unreachable:** IP or domain issuance remains certificate-pending and the log reports the HTTP-01 failure. Fix firewall/NAT/address routing; reconciliation retries with bounded backoff.
 - **Cloudflare rate limit or transient 5xx:** requests honor `Retry-After` and use bounded retries. Persisted pending work resumes later.
-- **Conflicting records:** Hostknot requires explicit replacement confirmation and stores the prior records in its encrypted state.
-- **DNS drift during edit/unbind:** the binding becomes drifted and Hostknot leaves externally changed records untouched.
+- **Conflicting records:** HostKnot requires explicit replacement confirmation and stores the prior records in its permission-protected state database.
+- **DNS drift during edit/unbind:** the binding remains in a retryable update or removal state, and HostKnot leaves externally changed records untouched.
 - **Upstream unavailable:** clients receive a minimal 502 and the binding becomes degraded. A successful request returns it to active/healthy.
 - **Lost admin password:** run `hostknot admin reset`; existing routes remain online.
 
