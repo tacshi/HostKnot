@@ -11,8 +11,9 @@ use uuid::Uuid;
 
 use crate::{
     certificates::CertificateResolver,
+    model::{Binding, BindingStatus, PendingBindingUpdate},
     provider::{DnsIntent, DnsProvider},
-    store::{Binding, Store},
+    store::Store,
 };
 
 #[derive(Clone)]
@@ -36,8 +37,6 @@ pub struct CreateBinding {
     #[serde(default)]
     pub proxied: bool,
     #[serde(default)]
-    pub insecure_tls: bool,
-    #[serde(default)]
     pub replace_existing: bool,
 }
 
@@ -47,8 +46,6 @@ pub struct UpdateBinding {
     pub upstream_port: u16,
     #[serde(default)]
     pub proxied: bool,
-    #[serde(default)]
-    pub insecure_tls: bool,
 }
 
 impl BindingManager {
@@ -82,7 +79,7 @@ impl BindingManager {
         }
         if input.upstream_port == 0 || self.reserved_ports.contains(&input.upstream_port) {
             bail!(
-                "port {} is one of Hostknot's own listeners (admin UI or proxy), so it cannot \
+                "port {} is one of HostKnot's own listeners (admin UI or proxy), so it cannot \
                  be bound — the admin UI is always reached directly at https://<VPS-IP>:9443. \
                  Bind the loopback port your application listens on instead.",
                 input.upstream_port
@@ -92,31 +89,26 @@ impl BindingManager {
             bail!("at least one public IP address is required");
         }
         let binding_id = Uuid::now_v7().to_string();
-        self.store.create_binding(
+        let binding = self.store.create_binding(
             &binding_id,
             &hostname,
             &input.upstream_scheme,
             input.upstream_port,
-            input.insecure_tls,
             input.proxied,
             input.replace_existing,
         )?;
-        let intent = DnsIntent {
-            binding_id: binding_id.clone(),
-            hostname: hostname.clone(),
-            public_ips: self.public_ips.clone(),
-            proxied: input.proxied,
-            replace_existing: input.replace_existing,
-        };
-        let receipt = match self.provider.apply(&intent).await {
+        let receipt = match self.apply_pending_dns(&binding).await {
             Ok(receipt) => receipt,
             Err(error) => {
                 if crate::provider::is_conflict(&error) {
                     self.store.delete_binding(&binding_id)?;
                     return Err(error);
                 }
-                self.store
-                    .mark_binding_error(&binding_id, "dns_pending", &error.to_string())?;
+                self.store.mark_binding_error(
+                    &binding_id,
+                    BindingStatus::DnsPending,
+                    &error.to_string(),
+                )?;
                 self.reconcile_nudge.notify_one();
                 return Err(error);
             }
@@ -130,21 +122,17 @@ impl BindingManager {
         match self.certificates.ensure_dns(&hostname).await {
             Ok(()) => {
                 self.store.mark_binding_active(&binding_id)?;
-                self.store
-                    .record_event("binding", &format!("Binding activated: {hostname}"))?;
+                self.record_event(&format!("Binding activated: {hostname}"));
             }
             Err(error) => {
                 self.store.mark_binding_error(
                     &binding_id,
-                    "certificate_pending",
+                    BindingStatus::CertificatePending,
                     &error.to_string(),
                 )?;
-                self.store.record_event(
-                    "binding",
-                    &format!(
-                        "Certificate issuance for {hostname} failed and will retry: {error:#}"
-                    ),
-                )?;
+                self.record_event(&format!(
+                    "Certificate issuance for {hostname} failed and will retry: {error:#}"
+                ));
                 self.reconcile_nudge.notify_one();
             }
         }
@@ -160,25 +148,23 @@ impl BindingManager {
         // Removal already ran and the route is draining; a second click must
         // be a harmless no-op, not a second revert that misreads its own
         // earlier deletion as drift.
-        if binding.status == "draining" {
+        if binding.status == BindingStatus::Draining {
             return Ok(());
         }
-        // A binding whose DNS apply never succeeded has no receipt and owns no
-        // records, so there is nothing to revert.
-        if let Some(receipt) = self.store.binding_receipt(id)?
-            && let Err(error) = self.provider.revert(&receipt).await
-        {
+        if binding.status == BindingStatus::Updating {
+            bail!("this binding's previous update is still being reconciled");
+        }
+        if binding.status != BindingStatus::Removing {
+            // Persist intent before the first provider write. A crash from
+            // this point onward is resumed by `reconcile_once`.
+            self.store.begin_binding_removal(id)?;
+        }
+        if let Err(error) = self.continue_removal(id, &binding.hostname).await {
             self.store
-                .mark_binding_error(id, "drifted", &error.to_string())?;
+                .mark_binding_error(id, BindingStatus::Removing, &error.to_string())?;
             self.reconcile_nudge.notify_one();
             return Err(error);
         }
-        self.store.mark_binding_draining(id, self.drain_duration)?;
-        self.store.record_event(
-            "binding",
-            &format!("Binding removal started: {}", binding.hostname),
-        )?;
-        self.schedule_drain(id.to_owned(), binding.hostname, self.drain_duration);
         Ok(())
     }
 
@@ -188,39 +174,33 @@ impl BindingManager {
         }
         if input.upstream_port == 0 || self.reserved_ports.contains(&input.upstream_port) {
             bail!(
-                "port {} is one of Hostknot's own listeners (admin UI or proxy), so it cannot \
+                "port {} is one of HostKnot's own listeners (admin UI or proxy), so it cannot \
                  be bound — the admin UI is always reached directly at https://<VPS-IP>:9443. \
                  Bind the loopback port your application listens on instead.",
                 input.upstream_port
             );
         }
         let binding = self.store.binding(id)?.context("binding does not exist")?;
-        if !matches!(binding.status.as_str(), "active" | "degraded") {
+        if !binding.status.is_editable() {
             bail!("only active bindings can be edited");
         }
-        let receipt = if binding.proxied != input.proxied {
-            let receipt = self
-                .store
-                .binding_receipt(id)?
-                .context("binding has no DNS receipt")?;
-            Some(
-                self.provider
-                    .set_proxy_mode(&receipt, input.proxied)
-                    .await?,
-            )
-        } else {
-            None
+        let update = PendingBindingUpdate {
+            upstream_scheme: input.upstream_scheme,
+            upstream_port: input.upstream_port,
+            proxied: input.proxied,
         };
-        self.store.update_binding(
-            id,
-            &input.upstream_scheme,
-            input.upstream_port,
-            input.insecure_tls,
-            input.proxied,
-            receipt.as_ref(),
-        )?;
-        self.store
-            .record_event("binding", &format!("Binding updated: {}", binding.hostname))?;
+        if binding.proxied != update.proxied {
+            self.store.begin_binding_update(id, &update)?;
+            if let Err(error) = self.continue_update(id).await {
+                self.store
+                    .mark_binding_error(id, BindingStatus::Updating, &error.to_string())?;
+                self.reconcile_nudge.notify_one();
+                return Err(error);
+            }
+        } else {
+            self.store.update_binding_local(id, &update)?;
+        }
+        self.record_event(&format!("Binding updated: {}", binding.hostname));
         Ok(())
     }
 
@@ -243,63 +223,54 @@ impl BindingManager {
     pub async fn reconcile_once(&self) -> Result<bool> {
         let mut pending = false;
         for binding in self.store.list_bindings()? {
-            match binding.status.as_str() {
-                "dns_pending" => {
+            match binding.status {
+                BindingStatus::DnsPending => {
                     pending = true;
-                    let intent = DnsIntent {
-                        binding_id: binding.id.clone(),
-                        hostname: binding.hostname.clone(),
-                        public_ips: self.public_ips.clone(),
-                        proxied: binding.proxied,
-                        // Re-use the operator's original confirmation so a
-                        // partially-failed, rolled-back replacement does not
-                        // deadlock on its own restored records.
-                        replace_existing: binding.replace_confirmed,
-                    };
-                    match self.provider.apply(&intent).await {
+                    match self.apply_pending_dns(&binding).await {
                         Ok(receipt) => {
                             self.store
                                 .mark_binding_certificate_pending(&binding.id, &receipt)?;
                         }
                         Err(error) => self.store.mark_binding_error(
                             &binding.id,
-                            "dns_pending",
+                            BindingStatus::DnsPending,
                             &error.to_string(),
                         )?,
                     }
                 }
-                "certificate_pending" => {
+                BindingStatus::CertificatePending => {
                     pending = true;
                     match self.certificates.ensure_dns(&binding.hostname).await {
                         Ok(()) => {
                             self.store.mark_binding_active(&binding.id)?;
-                            self.store.record_event(
-                                "binding",
-                                &format!("Binding activated: {}", binding.hostname),
-                            )?;
+                            self.record_event(&format!("Binding activated: {}", binding.hostname));
                         }
                         Err(error) => self.store.mark_binding_error(
                             &binding.id,
-                            "certificate_pending",
+                            BindingStatus::CertificatePending,
                             &error.to_string(),
                         )?,
                     }
                 }
-                "drifted" => {
-                    // Set when a removal's revert failed. Keep retrying: once
-                    // the operator resolves the external drift (or the
-                    // transient provider error clears), the removal finishes.
+                BindingStatus::Updating => {
                     pending = true;
-                    match self.store.binding_receipt(&binding.id)? {
-                        Some(receipt) => match self.provider.revert(&receipt).await {
-                            Ok(()) => self.finish_removal(&binding.id, &binding.hostname)?,
-                            Err(error) => self.store.mark_binding_error(
-                                &binding.id,
-                                "drifted",
-                                &error.to_string(),
-                            )?,
-                        },
-                        None => self.finish_removal(&binding.id, &binding.hostname)?,
+                    if let Err(error) = self.continue_update(&binding.id).await {
+                        self.store.mark_binding_error(
+                            &binding.id,
+                            BindingStatus::Updating,
+                            &error.to_string(),
+                        )?;
+                    }
+                }
+                BindingStatus::Removing => {
+                    pending = true;
+                    if let Err(error) = self.continue_removal(&binding.id, &binding.hostname).await
+                    {
+                        self.store.mark_binding_error(
+                            &binding.id,
+                            BindingStatus::Removing,
+                            &error.to_string(),
+                        )?;
                     }
                 }
                 _ => {}
@@ -308,12 +279,78 @@ impl BindingManager {
         Ok(pending)
     }
 
+    async fn apply_pending_dns(&self, binding: &Binding) -> Result<crate::provider::DnsReceipt> {
+        let plan = match self.store.binding_dns_plan(&binding.id)? {
+            Some(plan) => plan,
+            None => {
+                let plan = self
+                    .provider
+                    .prepare(&DnsIntent {
+                        binding_id: binding.id.clone(),
+                        hostname: binding.hostname.clone(),
+                        public_ips: self.public_ips.clone(),
+                        proxied: binding.proxied,
+                        // Re-use the operator's original confirmation so a
+                        // partially-failed replacement can be replayed from
+                        // its durable pre-image.
+                        replace_existing: binding.replace_confirmed,
+                    })
+                    .await?;
+                self.store.save_binding_dns_plan(&binding.id, &plan)?;
+                plan
+            }
+        };
+        self.provider.apply(&plan).await
+    }
+
+    async fn continue_update(&self, id: &str) -> Result<()> {
+        let update = self
+            .store
+            .pending_binding_update(id)?
+            .context("binding update journal is missing")?;
+        let receipt = self
+            .store
+            .binding_receipt(id)?
+            .context("binding has no DNS receipt")?;
+        let receipt = self
+            .provider
+            .set_proxy_mode(&receipt, update.proxied)
+            .await?;
+        self.store.finish_binding_update(id, &update, &receipt)
+    }
+
+    async fn continue_removal(&self, id: &str, hostname: &str) -> Result<()> {
+        let receipt = match self.store.binding_receipt(id)? {
+            Some(receipt) => Some(receipt),
+            None => match self.store.binding_dns_plan(id)? {
+                Some(plan) => {
+                    // A create may have crashed after a partial provider
+                    // mutation but before saving its receipt. Finish that
+                    // idempotent plan, journal the receipt, then revert it.
+                    let receipt = self.provider.apply(&plan).await?;
+                    self.store.save_binding_removal_receipt(id, &receipt)?;
+                    Some(receipt)
+                }
+                None => None,
+            },
+        };
+        if let Some(receipt) = receipt {
+            self.provider.revert(&receipt).await?;
+        }
+        self.finish_removal(id, hostname)
+    }
+
     fn finish_removal(&self, id: &str, hostname: &str) -> Result<()> {
         self.store.mark_binding_draining(id, self.drain_duration)?;
-        self.store
-            .record_event("binding", &format!("Binding removal started: {hostname}"))?;
         self.schedule_drain(id.to_owned(), hostname.to_owned(), self.drain_duration);
+        self.record_event(&format!("Binding removal started: {hostname}"));
         Ok(())
+    }
+
+    fn record_event(&self, message: &str) {
+        if let Err(error) = self.store.record_event("binding", message) {
+            tracing::warn!(%error, "failed to persist binding event");
+        }
     }
 
     fn resume_drains(&self) -> Result<()> {
@@ -374,11 +411,19 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     fn manager(store: &Store, drain: Duration) -> BindingManager {
+        manager_with_provider(store, drain, Arc::new(InMemoryDnsProvider::new(Vec::new())))
+    }
+
+    fn manager_with_provider(
+        store: &Store,
+        drain: Duration,
+        provider: Arc<dyn DnsProvider>,
+    ) -> BindingManager {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let certificates = CertificateResolver::new(store.clone(), CertificateMode::Local).unwrap();
         BindingManager::new(
             store.clone(),
-            Arc::new(InMemoryDnsProvider::new(Vec::new())),
+            provider,
             certificates,
             vec!["203.0.113.10".parse().unwrap()],
             Vec::<u16>::new(),
@@ -399,7 +444,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(dir.path()).unwrap();
         store
-            .create_binding("b1", "app.example.com", "http", 8080, false, false, false)
+            .create_binding("b1", "app.example.com", "http", 8080, false, false)
             .unwrap();
         store.mark_binding_draining("b1", Duration::ZERO).unwrap();
         // Let the stored drain deadline fall into the past before "restarting".
@@ -413,7 +458,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(dir.path()).unwrap();
         store
-            .create_binding("b1", "app.example.com", "http", 8080, false, false, false)
+            .create_binding("b1", "app.example.com", "http", 8080, false, false)
             .unwrap();
         let manager = manager(&store, Duration::ZERO);
         manager
@@ -421,6 +466,156 @@ mod tests {
             .await
             .expect("a binding stuck in dns_pending must still be removable");
         assert_deleted_soon(&store, "b1", "receipt-less binding was never deleted").await;
+    }
+
+    #[tokio::test]
+    async fn removing_an_incomplete_binding_does_not_make_it_routable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .create_binding("b1", "app.example.com", "http", 8080, false, false)
+            .unwrap();
+        manager(&store, Duration::from_secs(300))
+            .remove("b1")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.binding("b1").unwrap().unwrap().status,
+            BindingStatus::Draining
+        );
+        assert!(!store.hostname_is_routable("app.example.com").unwrap());
+    }
+
+    #[tokio::test]
+    async fn create_recovery_replays_the_journal_and_preserves_the_dns_preimage() {
+        let prior = crate::provider::DnsRecord {
+            id: "prior".to_owned(),
+            record_type: "CNAME".to_owned(),
+            name: "app.example.com".to_owned(),
+            content: "old.example.net".to_owned(),
+            proxied: false,
+            ttl: 300,
+            comment: None,
+        };
+        let provider = Arc::new(InMemoryDnsProvider::new(vec![prior.clone()]));
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let binding = store
+            .create_binding("b1", "app.example.com", "http", 8080, true, true)
+            .unwrap();
+        let plan = provider
+            .prepare(&DnsIntent {
+                binding_id: binding.id.clone(),
+                hostname: binding.hostname.clone(),
+                public_ips: vec!["203.0.113.10".parse().unwrap()],
+                proxied: true,
+                replace_existing: true,
+            })
+            .await
+            .unwrap();
+        store.save_binding_dns_plan(&binding.id, &plan).unwrap();
+
+        // Simulate a crash after Cloudflare committed but before SQLite saved
+        // the receipt. Recovery must reuse the journal instead of taking a
+        // new pre-image of its own managed record.
+        provider.apply(&plan).await.unwrap();
+        let manager = manager_with_provider(&store, Duration::from_secs(300), provider.clone());
+        manager.reconcile_once().await.unwrap();
+        assert_eq!(provider.records().len(), 1);
+        assert_eq!(
+            store.binding("b1").unwrap().unwrap().status,
+            BindingStatus::CertificatePending
+        );
+        manager.reconcile_once().await.unwrap();
+
+        manager.remove("b1").await.unwrap();
+        assert_eq!(provider.records(), vec![prior]);
+    }
+
+    #[tokio::test]
+    async fn update_recovery_accepts_an_already_applied_proxy_mode() {
+        let provider = Arc::new(InMemoryDnsProvider::new(Vec::new()));
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let binding = store
+            .create_binding("b1", "app.example.com", "http", 8080, false, false)
+            .unwrap();
+        let plan = provider
+            .prepare(&DnsIntent {
+                binding_id: binding.id.clone(),
+                hostname: binding.hostname.clone(),
+                public_ips: vec!["203.0.113.10".parse().unwrap()],
+                proxied: false,
+                replace_existing: false,
+            })
+            .await
+            .unwrap();
+        let receipt = provider.apply(&plan).await.unwrap();
+        store
+            .mark_binding_certificate_pending(&binding.id, &receipt)
+            .unwrap();
+        store.mark_binding_active(&binding.id).unwrap();
+        let update = PendingBindingUpdate {
+            upstream_scheme: "https".to_owned(),
+            upstream_port: 8443,
+            proxied: true,
+        };
+        store.begin_binding_update(&binding.id, &update).unwrap();
+
+        // Simulate the remote write winning just before process death.
+        provider.set_proxy_mode(&receipt, true).await.unwrap();
+        manager_with_provider(&store, Duration::from_secs(300), provider.clone())
+            .reconcile_once()
+            .await
+            .unwrap();
+
+        let recovered = store.binding(&binding.id).unwrap().unwrap();
+        assert_eq!(recovered.status, BindingStatus::Active);
+        assert_eq!(recovered.upstream_scheme, "https");
+        assert_eq!(recovered.upstream_port, 8443);
+        assert!(recovered.proxied);
+        assert!(provider.records()[0].proxied);
+    }
+
+    #[tokio::test]
+    async fn removal_recovery_accepts_records_that_are_already_reverted() {
+        let provider = Arc::new(InMemoryDnsProvider::new(Vec::new()));
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let binding = store
+            .create_binding("b1", "app.example.com", "http", 8080, false, false)
+            .unwrap();
+        let plan = provider
+            .prepare(&DnsIntent {
+                binding_id: binding.id.clone(),
+                hostname: binding.hostname.clone(),
+                public_ips: vec!["203.0.113.10".parse().unwrap()],
+                proxied: false,
+                replace_existing: false,
+            })
+            .await
+            .unwrap();
+        let receipt = provider.apply(&plan).await.unwrap();
+        store
+            .mark_binding_certificate_pending(&binding.id, &receipt)
+            .unwrap();
+        store.mark_binding_active(&binding.id).unwrap();
+        store.begin_binding_removal(&binding.id).unwrap();
+
+        // Simulate death after the records were reverted but before the local
+        // transition to draining was committed.
+        provider.revert(&receipt).await.unwrap();
+        manager_with_provider(&store, Duration::from_secs(300), provider.clone())
+            .reconcile_once()
+            .await
+            .unwrap();
+
+        assert!(provider.records().is_empty());
+        assert_eq!(
+            store.binding(&binding.id).unwrap().unwrap().status,
+            BindingStatus::Draining
+        );
     }
 
     #[tokio::test]
@@ -437,7 +632,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(dir.path()).unwrap();
         store
-            .create_binding("b1", "app.example.com", "https", port, false, false, false)
+            .create_binding("b1", "app.example.com", "https", port, false, false)
             .unwrap();
         store.mark_binding_active("b1").unwrap();
         store
@@ -450,8 +645,8 @@ mod tests {
             .unwrap();
 
         let binding = store.binding("b1").unwrap().unwrap();
-        assert_eq!(binding.status, "degraded");
-        assert_eq!(binding.health, "unavailable");
+        assert_eq!(binding.status, BindingStatus::Degraded);
+        assert_eq!(binding.health, crate::model::BindingHealth::Unavailable);
         server.abort();
     }
 }

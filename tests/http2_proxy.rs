@@ -10,7 +10,7 @@ use axum::{
     http::HeaderMap,
     routing::{any, get, post},
 };
-use hostknot::{CloudflareEndpoints, Config, Hostknot};
+use hostknot::{CloudflareEndpoints, Config, HostKnot};
 use reqwest::{Client, StatusCode, redirect::Policy};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -54,7 +54,7 @@ async fn http2_requests_route_by_authority_and_reach_http1_upstreams() {
             token: Url::parse(&format!("http://{provider_addr}/oauth2/token")).unwrap(),
             api: Url::parse(&format!("http://{provider_addr}/client/v4/")).unwrap(),
         });
-    let running = Hostknot::start(config).await.unwrap();
+    let running = HostKnot::start(config).await.unwrap();
     let base = format!("http://{}", running.admin_addr());
     let browser = Client::builder()
         .redirect(Policy::none())
@@ -189,7 +189,6 @@ async fn create_binding(browser: &Client, base: &str, hostname: &str, port: u16)
             ("upstream_scheme", "http".to_owned()),
             ("upstream_port", port.to_string()),
             ("proxied", "true".to_owned()),
-            ("insecure_tls", "false".to_owned()),
             ("replace_existing", "false".to_owned()),
         ])
         .send()

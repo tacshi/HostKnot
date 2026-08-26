@@ -1,0 +1,24 @@
+[
+  {
+    "date": "2026-08-26",
+    "mode": "Health Dashboard",
+    "score": 90,
+    "findings": {
+      "critical": 1,
+      "warning": 3,
+      "suggestion": 0
+    },
+    "scope": "entire hostknot repository; PR dimension skipped because there was no staged or tracked working-tree diff"
+  },
+  {
+    "date": "2026-08-26",
+    "mode": "Full Sweep",
+    "score": 100,
+    "findings": {
+      "critical": 0,
+      "warning": 0,
+      "suggestion": 0
+    },
+    "scope": "entire HostKnot repository; all findings from the preceding health dashboard fixed and verified with Rust and Playwright suites"
+  }
+]

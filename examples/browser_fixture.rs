@@ -1,4 +1,4 @@
-//! Runs a real Hostknot process for the Playwright suite, plus a
+//! Runs a real HostKnot process for the Playwright suite, plus a
 //! protocol-level fake Cloudflare (OAuth + DNS API) and a live loopback
 //! upstream so the browser can exercise the full connect/bind/unbind flow.
 
@@ -16,7 +16,7 @@ use axum::{
     response::Redirect,
     routing::{get, post},
 };
-use hostknot::{CloudflareEndpoints, Config, Hostknot};
+use hostknot::{CloudflareEndpoints, Config, HostKnot};
 use serde_json::{Value, json};
 use url::Url;
 
@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
             token: Url::parse(&format!("http://{provider_addr}/oauth2/token"))?,
             api: Url::parse(&format!("http://{provider_addr}/client/v4/"))?,
         });
-    let running = Hostknot::start(config).await?;
+    let running = HostKnot::start(config).await?;
     if let Some(token) = running.bootstrap_token() {
         println!("http://{}/setup?token={token}", running.admin_addr());
     }

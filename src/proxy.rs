@@ -24,7 +24,7 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
 
-use crate::{certificates::CertificateResolver, store::Store};
+use crate::{certificates::CertificateResolver, model::BindingHealth, store::Store};
 
 /// Upstream URIs carry the binding hostname (so TLS verification and SNI run
 /// against a name a real certificate can match), while this resolver pins the
@@ -183,7 +183,7 @@ async fn proxy_entry(
     *request.uri_mut() = upstream_uri;
     // Downstream h2 requests must not force h2 on the loopback connection.
     *request.version_mut() = axum::http::Version::HTTP_11;
-    // HTTPS upstreams are pinned to loopback by the connector. Hostknot owns
+    // HTTPS upstreams are pinned to loopback by the connector. HostKnot owns
     // the public certificate, so a private/self-signed certificate on this
     // local-only hop must not require operator configuration.
     let client = if binding.upstream_scheme == "https" {
@@ -195,7 +195,7 @@ async fn proxy_entry(
         Ok(mut response) => {
             // Persist health only on transitions — a WAL commit per proxied
             // request would serialize all traffic on the store mutex.
-            if binding.health != "healthy"
+            if binding.health != BindingHealth::Healthy
                 && let Err(error) = state.store.update_binding_health(&binding.id, true, None)
             {
                 tracing::debug!(%error, "failed to persist upstream health");
@@ -229,11 +229,11 @@ async fn proxy_entry(
             tracing::warn!(hostname, %error, "upstream request failed");
             let health_error = if binding.upstream_scheme == "https" {
                 "HTTPS upstream failed. Verify the local service actually uses HTTPS on this \
-                 port; Hostknot already accepts its private/self-signed certificate."
+                 port; HostKnot already accepts its private/self-signed certificate."
             } else {
                 "HTTP upstream failed. Verify the local service is running on this port."
             };
-            if (binding.health != "unavailable"
+            if (binding.health != BindingHealth::Unavailable
                 || binding.last_error.as_deref() != Some(health_error))
                 && let Err(store_error) =
                     state

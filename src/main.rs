@@ -2,7 +2,7 @@ use std::{net::IpAddr, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use hostknot::{FileConfig, Hostknot};
+use hostknot::{FileConfig, HostKnot};
 
 #[derive(Debug, Parser)]
 #[command(name = "hostknot", about, disable_version_flag = true)]
@@ -15,7 +15,7 @@ struct Cli {
 enum Command {
     /// Run the administration and reverse-proxy listeners.
     Serve(ConfigArgs),
-    /// Check whether this host is ready to run Hostknot.
+    /// Check whether this host is ready to run HostKnot.
     Doctor(DoctorArgs),
     /// Manage the system service.
     Service {
@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
         Command::Serve(args) => {
             let config = FileConfig::load(&args.config)?.runtime();
             let public_url = config.admin_public_url.clone();
-            let running = Hostknot::start(config).await?;
+            let running = HostKnot::start(config).await?;
             if let Some(token) = running.bootstrap_token() {
                 let setup_url = public_url
                     .context("admin public URL is required")?
@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
                 binary: &binary,
                 public_ips: &args.public_ips,
             })?;
-            println!("Hostknot systemd service installed");
+            println!("HostKnot systemd service installed");
             println!("Next steps:");
             println!("  systemctl daemon-reload");
             println!("  systemctl enable --now hostknot");
@@ -127,7 +127,7 @@ async fn main() -> Result<()> {
         Command::Admin {
             command: AdminCommand::Reset(args),
         } => {
-            let token = Hostknot::reset_admin(&args.state_dir)?;
+            let token = HostKnot::reset_admin(&args.state_dir)?;
             println!("One-time administrator setup token: {token}");
         }
     }

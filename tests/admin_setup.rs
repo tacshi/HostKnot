@@ -1,18 +1,18 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use hostknot::{Clock, Config, Hostknot};
+use hostknot::{Clock, Config, HostKnot, RunningHostKnot};
 use reqwest::{Client, StatusCode, redirect::Policy};
 use tempfile::TempDir;
 
 #[tokio::test]
 async fn bootstrap_token_creates_the_administrator_once() {
     let state = TempDir::new().expect("temporary state directory");
-    let running = Hostknot::start(Config::for_test(
+    let running = HostKnot::start(Config::for_test(
         state.path(),
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
     ))
     .await
-    .expect("start Hostknot");
+    .expect("start HostKnot");
     let token = running
         .bootstrap_token()
         .expect("fresh installations have a bootstrap token");
@@ -66,6 +66,12 @@ async fn bootstrap_token_creates_the_administrator_once() {
         .expect("reuse setup token");
     assert_eq!(reused.status(), StatusCode::FORBIDDEN);
 
+    running.shutdown().await;
+}
+
+#[tokio::test]
+async fn csrf_origin_policy_accepts_local_navigation_and_rejects_cross_site_posts() {
+    let (_state, running, base, client) = configured_admin(Clock::system()).await;
     let provider_page = client
         .get(format!("{base}/providers/cloudflare"))
         .send()
@@ -141,6 +147,21 @@ async fn bootstrap_token_creates_the_administrator_once() {
         .unwrap();
     assert_eq!(null_cross_site.status(), StatusCode::FORBIDDEN);
 
+    running.shutdown().await;
+}
+
+#[tokio::test]
+async fn logout_invalidates_the_session_and_failed_logins_are_throttled() {
+    let (_state, running, base, client) = configured_admin(Clock::system()).await;
+    let provider_page = client
+        .get(format!("{base}/providers/cloudflare"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = hidden_value(&provider_page, "csrf");
     let logout = client
         .post(format!("{base}/logout"))
         .form(&[("csrf", csrf.as_str())])
@@ -182,7 +203,7 @@ async fn admin_reset_invalidates_sessions_and_issues_a_new_setup_token() {
         state.path(),
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
     );
-    let running = Hostknot::start(config).await.unwrap();
+    let running = HostKnot::start(config).await.unwrap();
     let token = running.bootstrap_token().unwrap();
     let base = format!("http://{}", running.admin_addr());
     let client = Client::builder()
@@ -208,7 +229,7 @@ async fn admin_reset_invalidates_sessions_and_issues_a_new_setup_token() {
 
     // `hostknot admin reset` runs against the live service's state directory,
     // exactly like the CLI on a VPS.
-    let reset_token = Hostknot::reset_admin(state.path()).expect("reset administrator");
+    let reset_token = HostKnot::reset_admin(state.path()).expect("reset administrator");
     assert_ne!(reset_token, token);
 
     // The pre-reset session cookie must no longer authenticate.
@@ -240,7 +261,7 @@ async fn admin_reset_invalidates_sessions_and_issues_a_new_setup_token() {
 }
 
 #[tokio::test]
-async fn time_based_expiries_are_enforced() {
+async fn bootstrap_tokens_expire_and_restart_issues_a_fresh_one() {
     let clock = Clock::system();
     let state = TempDir::new().unwrap();
     let config = Config::for_test(
@@ -248,7 +269,7 @@ async fn time_based_expiries_are_enforced() {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
     )
     .with_clock(clock.clone());
-    let running = Hostknot::start(config.clone()).await.unwrap();
+    let running = HostKnot::start(config.clone()).await.unwrap();
     let stale_token = running.bootstrap_token().unwrap();
     let base = format!("http://{}", running.admin_addr());
     let client = Client::builder()
@@ -273,7 +294,7 @@ async fn time_based_expiries_are_enforced() {
 
     // A restart issues a fresh token, which works.
     running.shutdown().await;
-    let running = Hostknot::start(config).await.unwrap();
+    let running = HostKnot::start(config).await.unwrap();
     let base = format!("http://{}", running.admin_addr());
     let token = running.bootstrap_token().unwrap();
     let setup = client
@@ -288,7 +309,13 @@ async fn time_based_expiries_are_enforced() {
         .unwrap();
     assert_eq!(setup.status(), StatusCode::SEE_OTHER);
 
-    // Login throttling releases after its five-minute window.
+    running.shutdown().await;
+}
+
+#[tokio::test]
+async fn login_throttling_releases_after_its_window() {
+    let clock = Clock::system();
+    let (_state, running, base, _client) = configured_admin(clock.clone()).await;
     let attacker = Client::new();
     for _ in 0..5 {
         attacker
@@ -314,7 +341,12 @@ async fn time_based_expiries_are_enforced() {
         .unwrap();
     assert_eq!(released.status(), StatusCode::UNAUTHORIZED);
 
-    // Binding Hostknot's own admin port is rejected with an explanation.
+    running.shutdown().await;
+}
+
+#[tokio::test]
+async fn hostknot_listener_ports_cannot_be_bound_as_upstreams() {
+    let (_state, running, base, client) = configured_admin(Clock::system()).await;
     let bindings_page = client
         .get(format!("{base}/bindings/new"))
         .send()
@@ -332,7 +364,6 @@ async fn time_based_expiries_are_enforced() {
             ("upstream_scheme", "http"),
             ("upstream_port", &admin_port),
             ("proxied", "true"),
-            ("insecure_tls", "false"),
             ("replace_existing", "false"),
         ])
         .send()
@@ -343,7 +374,21 @@ async fn time_based_expiries_are_enforced() {
     assert!(body.contains("own listeners"));
     assert!(body.contains("admin UI"));
 
-    // Sessions expire after twelve hours.
+    running.shutdown().await;
+}
+
+#[tokio::test]
+async fn expired_sessions_redirect_reads_and_mutations_to_login() {
+    let clock = Clock::system();
+    let (_state, running, base, client) = configured_admin(clock.clone()).await;
+    let bindings_page = client
+        .get(format!("{base}/bindings/new"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert_eq!(
         client.get(&base).send().await.unwrap().status(),
         StatusCode::OK
@@ -363,7 +408,6 @@ async fn time_based_expiries_are_enforced() {
             ("upstream_scheme", "http"),
             ("upstream_port", "8080"),
             ("proxied", "true"),
-            ("insecure_tls", "false"),
             ("replace_existing", "false"),
         ])
         .send()
@@ -373,6 +417,35 @@ async fn time_based_expiries_are_enforced() {
     assert_eq!(expired_post.headers()["location"], "/login");
 
     running.shutdown().await;
+}
+
+async fn configured_admin(clock: Clock) -> (TempDir, RunningHostKnot, String, Client) {
+    let state = TempDir::new().unwrap();
+    let config = Config::for_test(
+        state.path(),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+    )
+    .with_clock(clock);
+    let running = HostKnot::start(config).await.unwrap();
+    let base = format!("http://{}", running.admin_addr());
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let token = running.bootstrap_token().unwrap();
+    let setup = client
+        .post(format!("{base}/setup"))
+        .form(&[
+            ("token", token.as_str()),
+            ("password", "correct horse battery staple"),
+            ("acme_email", "operator@example.com"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(setup.status(), StatusCode::SEE_OTHER);
+    (state, running, base, client)
 }
 
 fn hidden_value(html: &str, name: &str) -> String {

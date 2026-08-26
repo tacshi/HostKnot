@@ -26,11 +26,11 @@ export async function startFixture() {
   const { setupUrl, upstreamPort } = await new Promise((resolve, reject) => {
     let output = "";
     const timeout = setTimeout(
-      () => reject(new Error("Hostknot fixture did not start")),
+      () => reject(new Error("HostKnot fixture did not start")),
       60_000
     );
     processHandle.once("exit", code =>
-      reject(new Error(`Hostknot exited with ${code}`))
+      reject(new Error(`HostKnot exited with ${code}`))
     );
     processHandle.stdout.on("data", chunk => {
       output += chunk.toString();

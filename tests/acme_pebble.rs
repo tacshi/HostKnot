@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
 };
 
-use hostknot::{AcmeConfig, CertificateMode, Clock, Config, Hostknot};
+use hostknot::{AcmeConfig, CertificateMode, Clock, Config, HostKnot};
 use reqwest::{Certificate, Client, StatusCode, redirect::Policy};
 use tempfile::TempDir;
 
@@ -34,7 +34,7 @@ async fn pebble_issues_persists_and_renews_the_admin_ip_certificate() {
         .with_renewal_check_interval(std::time::Duration::from_millis(500));
     config.secure_admin_cookies = true;
 
-    let running = Hostknot::start(config.clone()).await.unwrap();
+    let running = HostKnot::start(config.clone()).await.unwrap();
     let root_pem = std::fs::read(&root).unwrap();
     let management = std::env::var("HOSTKNOT_PEBBLE_MANAGEMENT")
         .unwrap_or_else(|_| "https://localhost:15000".to_owned());
@@ -63,7 +63,7 @@ async fn pebble_issues_persists_and_renews_the_admin_ip_certificate() {
     let certificate_before_restart = peer_certificate(running.admin_addr()).await;
     running.shutdown().await;
 
-    let restarted = Hostknot::start(config).await.unwrap();
+    let restarted = HostKnot::start(config).await.unwrap();
     assert!(restarted.bootstrap_token().is_some());
     // The certificate must be restored from the store, not silently re-issued.
     assert_eq!(

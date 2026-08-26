@@ -375,7 +375,7 @@ fn default_acme_directory_url() -> String {
 }
 
 const SYSTEMD_UNIT: &str = r#"[Unit]
-Description=Hostknot domain binding proxy
+Description=HostKnot domain binding proxy
 Wants=network-online.target
 After=network-online.target
 

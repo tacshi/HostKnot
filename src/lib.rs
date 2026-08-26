@@ -4,6 +4,7 @@ mod certificates;
 mod clock;
 mod cloudflare;
 mod crypto;
+mod model;
 pub mod operations;
 mod provider;
 mod proxy;
@@ -110,12 +111,16 @@ impl Config {
     }
 }
 
-pub struct Hostknot;
+pub struct HostKnot;
 
-impl Hostknot {
-    pub async fn start(config: Config) -> Result<RunningHostknot> {
+#[doc(hidden)]
+#[deprecated(note = "renamed to HostKnot")]
+pub type Hostknot = HostKnot;
+
+impl HostKnot {
+    pub async fn start(config: Config) -> Result<RunningHostKnot> {
         let store = Store::open_with_clock(&config.state_dir, config.clock.clone())
-            .context("open Hostknot state")?;
+            .context("open HostKnot state")?;
         let bootstrap_token = store
             .issue_bootstrap_if_unconfigured()
             .context("issue bootstrap token")?;
@@ -291,7 +296,7 @@ impl Hostknot {
             }
         });
 
-        Ok(RunningHostknot {
+        Ok(RunningHostKnot {
             admin_addr,
             http_addr,
             https_addr,
@@ -316,7 +321,7 @@ impl Hostknot {
     }
 }
 
-pub struct RunningHostknot {
+pub struct RunningHostKnot {
     admin_addr: SocketAddr,
     http_addr: SocketAddr,
     https_addr: SocketAddr,
@@ -325,7 +330,11 @@ pub struct RunningHostknot {
     tasks: Vec<JoinHandle<()>>,
 }
 
-impl RunningHostknot {
+#[doc(hidden)]
+#[deprecated(note = "renamed to RunningHostKnot")]
+pub type RunningHostknot = RunningHostKnot;
+
+impl RunningHostKnot {
     pub fn admin_addr(&self) -> SocketAddr {
         self.admin_addr
     }

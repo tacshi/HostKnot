@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, State},
     routing::{get, post},
 };
-use hostknot::{CloudflareEndpoints, Config, Hostknot};
+use hostknot::{CloudflareEndpoints, Config, HostKnot};
 use reqwest::{Client, StatusCode, redirect::Policy};
 use serde_json::json;
 use tempfile::TempDir;
@@ -29,7 +29,7 @@ async fn binding_submission_starts_cloudflare_authorization_when_tokens_are_miss
         token: Url::parse("https://dash.cloudflare.test/oauth2/token").unwrap(),
         api: Url::parse("https://api.cloudflare.test/client/v4/").unwrap(),
     });
-    let running = Hostknot::start(config).await.unwrap();
+    let running = HostKnot::start(config).await.unwrap();
     let base = format!("http://{}", running.admin_addr());
     let client = Client::builder()
         .redirect(Policy::none())
@@ -84,7 +84,6 @@ async fn binding_submission_starts_cloudflare_authorization_when_tokens_are_miss
             ("upstream_scheme", "http"),
             ("upstream_port", "8080"),
             ("proxied", "true"),
-            ("insecure_tls", "false"),
             ("replace_existing", "false"),
         ])
         .send()
@@ -221,7 +220,7 @@ async fn cloudflare_oauth_uses_pkce_and_rejects_callback_replay() {
         token: Url::parse(&format!("http://{fake_addr}/oauth2/token")).unwrap(),
         api: Url::parse(&format!("http://{fake_addr}/client/v4/")).unwrap(),
     });
-    let running = Hostknot::start(config).await.unwrap();
+    let running = HostKnot::start(config).await.unwrap();
     let base = format!("http://{}", running.admin_addr());
     let client = Client::builder()
         .redirect(Policy::none())
@@ -377,7 +376,6 @@ async fn cloudflare_oauth_uses_pkce_and_rejects_callback_replay() {
             ("upstream_scheme", "http"),
             ("upstream_port", "8080"),
             ("proxied", "true"),
-            ("insecure_tls", "false"),
             ("replace_existing", "false"),
         ])
         .send()

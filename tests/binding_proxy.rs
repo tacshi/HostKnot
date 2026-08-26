@@ -13,7 +13,7 @@ use axum::{
     routing::{any, get, post},
 };
 use futures_util::{SinkExt, StreamExt};
-use hostknot::{CloudflareEndpoints, Config, Hostknot};
+use hostknot::{CloudflareEndpoints, Config, HostKnot, RunningHostKnot};
 use reqwest::{Client, StatusCode, redirect::Policy};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -21,8 +21,29 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use url::Url;
 
+#[derive(Clone, Copy)]
+enum ProxyScenario {
+    Forwarding,
+    UpdatesAndHealth,
+    ProtocolsAndRestart,
+}
+
 #[tokio::test]
-async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
+async fn binding_forwards_headers_and_streams_responses() {
+    run_proxy_scenario(ProxyScenario::Forwarding).await;
+}
+
+#[tokio::test]
+async fn binding_updates_upstreams_proxy_mode_and_health() {
+    run_proxy_scenario(ProxyScenario::UpdatesAndHealth).await;
+}
+
+#[tokio::test]
+async fn binding_supports_websockets_redirects_and_certificate_restart() {
+    run_proxy_scenario(ProxyScenario::ProtocolsAndRestart).await;
+}
+
+async fn run_proxy_scenario(scenario: ProxyScenario) {
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_port = upstream_listener.local_addr().unwrap().port();
     let upstream = Router::new()
@@ -78,29 +99,6 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
     let upstream_task = tokio::spawn(async move {
         axum::serve(upstream_listener, upstream).await.unwrap();
     });
-    let updated_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let updated_port = updated_listener.local_addr().unwrap().port();
-    let updated_task = tokio::spawn(async move {
-        axum::serve(
-            updated_listener,
-            Router::new()
-                .route("/hello", get(|| async { "updated upstream" }))
-                .route(
-                    "/ws",
-                    get(|upgrade: axum::extract::WebSocketUpgrade| async move {
-                        upgrade.on_upgrade(|mut socket| async move {
-                            if let Some(Ok(message)) = socket.recv().await {
-                                let _ = socket.send(message).await;
-                            }
-                        })
-                    }),
-                ),
-        )
-        .await
-        .unwrap();
-    });
-    let (https_upstream_port, https_upstream_task) = tls_upstream().await;
-
     let created_records = Arc::new(Mutex::new(Vec::<Value>::new()));
     let provider_state = created_records.clone();
     let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -189,7 +187,7 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
             token: Url::parse(&format!("http://{provider_addr}/oauth2/token")).unwrap(),
             api: Url::parse(&format!("http://{provider_addr}/client/v4/")).unwrap(),
         });
-    let running = Hostknot::start(config.clone()).await.unwrap();
+    let running = HostKnot::start(config.clone()).await.unwrap();
     let base = format!("http://{}", running.admin_addr());
     let browser = Client::builder()
         .redirect(Policy::none())
@@ -215,7 +213,6 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
             ("upstream_scheme", "http"),
             ("upstream_port", &upstream_port.to_string()),
             ("proxied", "true"),
-            ("insecure_tls", "false"),
             ("replace_existing", "false"),
         ])
         .send()
@@ -249,6 +246,32 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
         .redirect(Policy::none())
         .build()
         .unwrap();
+    match scenario {
+        ProxyScenario::Forwarding => {
+            assert_forwarding_and_streaming(&running, &proxy).await;
+            running.shutdown().await;
+        }
+        ProxyScenario::UpdatesAndHealth => {
+            assert_updates_and_health(
+                &running,
+                &browser,
+                &base,
+                &proxy,
+                &created_records,
+                &app_binding_id,
+            )
+            .await;
+            running.shutdown().await;
+        }
+        ProxyScenario::ProtocolsAndRestart => {
+            assert_protocols_and_restart(running, config, &proxy).await;
+        }
+    }
+    provider_task.abort();
+    upstream_task.abort();
+}
+
+async fn assert_forwarding_and_streaming(running: &RunningHostKnot, proxy: &Client) {
     let proxied = proxy
         .get(format!("https://{}/hello", running.https_addr()))
         .header("host", "app.example.com")
@@ -277,9 +300,8 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
         .unwrap();
     assert_eq!(streaming.headers()["content-type"], "text/event-stream");
     let mut events = streaming.bytes_stream();
-    // Generous timeout for loaded CI runners; buffering is still caught
-    // because a buffered response would deliver both events in one chunk and
-    // fail the equality assertion below.
+    // Generous timeout for loaded CI runners; a buffered response would still
+    // deliver both events together and fail the first equality assertion.
     let first = tokio::time::timeout(std::time::Duration::from_secs(2), events.next())
         .await
         .expect("first SSE event is streamed without waiting")
@@ -292,7 +314,26 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
         .unwrap()
         .unwrap();
     assert_eq!(second, "data: second\n\n");
+}
 
+async fn assert_updates_and_health(
+    running: &RunningHostKnot,
+    browser: &Client,
+    base: &str,
+    proxy: &Client,
+    created_records: &Arc<Mutex<Vec<Value>>>,
+    app_binding_id: &str,
+) {
+    let updated_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let updated_port = updated_listener.local_addr().unwrap().port();
+    let updated_task = tokio::spawn(async move {
+        axum::serve(
+            updated_listener,
+            Router::new().route("/hello", get(|| async { "updated upstream" })),
+        )
+        .await
+        .unwrap();
+    });
     let edit_page = browser
         .get(format!("{base}/bindings/{app_binding_id}/edit"))
         .send()
@@ -310,7 +351,6 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
             ("upstream_scheme", "http".to_owned()),
             ("upstream_port", updated_port.to_string()),
             ("proxied", "false".to_owned()),
-            ("insecure_tls", "false".to_owned()),
         ])
         .send()
         .await
@@ -333,13 +373,13 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
         false
     );
 
+    let (https_upstream_port, https_upstream_task) = tls_upstream().await;
     create_binding(
-        &browser,
-        &base,
+        browser,
+        base,
         "secure.example.com",
         "https",
         https_upstream_port,
-        false,
     )
     .await;
     let secure = proxy
@@ -354,15 +394,7 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
     let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let unavailable_port = unavailable.local_addr().unwrap().port();
     drop(unavailable);
-    create_binding(
-        &browser,
-        &base,
-        "down.example.com",
-        "http",
-        unavailable_port,
-        false,
-    )
-    .await;
+    create_binding(browser, base, "down.example.com", "http", unavailable_port).await;
     let failed = proxy
         .get(format!("https://{}/", running.https_addr()))
         .header("host", "down.example.com")
@@ -372,7 +404,7 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
     assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(failed.text().await.unwrap(), "Upstream unavailable");
     let status_page = browser
-        .get(&base)
+        .get(base)
         .send()
         .await
         .unwrap()
@@ -384,6 +416,11 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
     assert!(status_page.contains("HTTP upstream failed"));
     assert!(status_page.contains("Binding activated"));
 
+    updated_task.abort();
+    https_upstream_task.abort();
+}
+
+async fn assert_protocols_and_restart(running: RunningHostKnot, config: Config, proxy: &Client) {
     let request = format!("wss://{}/ws", running.https_addr())
         .into_client_request()
         .unwrap();
@@ -394,7 +431,7 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
         Some(tokio_tungstenite::Connector::Rustls(insecure_tls_client())),
     )
     .await
-    .expect("WebSocket upgrade through Hostknot");
+    .expect("WebSocket upgrade through HostKnot");
     websocket
         .send(tokio_tungstenite::tungstenite::Message::Text("ping".into()))
         .await
@@ -433,7 +470,7 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
     let certificate_before_restart =
         peer_certificate(running.https_addr(), "app.example.com").await;
     running.shutdown().await;
-    let restarted = Hostknot::start(config).await.unwrap();
+    let restarted = HostKnot::start(config).await.unwrap();
     assert!(restarted.bootstrap_token().is_none());
     let certificate_after_restart =
         peer_certificate(restarted.https_addr(), "app.example.com").await;
@@ -446,10 +483,6 @@ async fn browser_binding_creates_dns_and_routes_exact_host_over_tls() {
         .unwrap();
     assert_eq!(after_restart.status(), StatusCode::OK);
     restarted.shutdown().await;
-    provider_task.abort();
-    upstream_task.abort();
-    updated_task.abort();
-    https_upstream_task.abort();
 }
 
 async fn peer_certificate(address: std::net::SocketAddr, server_name: &str) -> Vec<u8> {
@@ -468,14 +501,7 @@ async fn peer_certificate(address: std::net::SocketAddr, server_name: &str) -> V
         .to_vec()
 }
 
-async fn create_binding(
-    browser: &Client,
-    base: &str,
-    hostname: &str,
-    scheme: &str,
-    port: u16,
-    insecure_tls: bool,
-) {
+async fn create_binding(browser: &Client, base: &str, hostname: &str, scheme: &str, port: u16) {
     let page = browser
         .get(format!("{base}/bindings/new"))
         .send()
@@ -492,7 +518,6 @@ async fn create_binding(
             ("upstream_scheme", scheme.to_owned()),
             ("upstream_port", port.to_string()),
             ("proxied", "true".to_owned()),
-            ("insecure_tls", insecure_tls.to_string()),
             ("replace_existing", "false".to_owned()),
         ])
         .send()

@@ -11,7 +11,7 @@ use axum::{
     http::StatusCode as AxumStatus,
     routing::{delete, get, post},
 };
-use hostknot::{CloudflareEndpoints, Config, Hostknot};
+use hostknot::{CloudflareEndpoints, Config, HostKnot};
 use reqwest::{Client, StatusCode, redirect::Policy};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -53,7 +53,7 @@ async fn conflicting_dns_requires_confirmation_and_is_restored_on_unbind() {
             token: Url::parse(&format!("http://{provider_addr}/oauth2/token")).unwrap(),
             api: Url::parse(&format!("http://{provider_addr}/client/v4/")).unwrap(),
         });
-    let running = Hostknot::start(config.clone()).await.unwrap();
+    let running = HostKnot::start(config.clone()).await.unwrap();
     let base = format!("http://{}", running.admin_addr());
     let browser = Client::builder()
         .redirect(Policy::none())
@@ -100,7 +100,7 @@ async fn conflicting_dns_requires_confirmation_and_is_restored_on_unbind() {
     assert_eq!(dns.records.lock().unwrap()[0]["content"], "old.example.net");
 
     running.shutdown().await;
-    let restarted = Hostknot::start(config).await.unwrap();
+    let restarted = HostKnot::start(config).await.unwrap();
     let base = format!("http://{}", restarted.admin_addr());
     let mut dashboard = String::new();
     for _ in 0..40 {
@@ -142,7 +142,7 @@ async fn unbind_is_idempotent_and_tolerates_already_deleted_records() {
             token: Url::parse(&format!("http://{provider_addr}/oauth2/token")).unwrap(),
             api: Url::parse(&format!("http://{provider_addr}/client/v4/")).unwrap(),
         });
-    let running = Hostknot::start(config).await.unwrap();
+    let running = HostKnot::start(config).await.unwrap();
     let base = format!("http://{}", running.admin_addr());
     let browser = Client::builder()
         .redirect(Policy::none())
@@ -211,7 +211,7 @@ async fn unbind_succeeds_when_managed_records_were_already_deleted_externally() 
             token: Url::parse(&format!("http://{provider_addr}/oauth2/token")).unwrap(),
             api: Url::parse(&format!("http://{provider_addr}/client/v4/")).unwrap(),
         });
-    let running = Hostknot::start(config).await.unwrap();
+    let running = HostKnot::start(config).await.unwrap();
     let base = format!("http://{}", running.admin_addr());
     let browser = Client::builder()
         .redirect(Policy::none())
@@ -323,7 +323,7 @@ async fn external_drift_blocks_unbind_and_recovers_when_restored() {
             token: Url::parse(&format!("http://{provider_addr}/oauth2/token")).unwrap(),
             api: Url::parse(&format!("http://{provider_addr}/client/v4/")).unwrap(),
         });
-    let running = Hostknot::start(config).await.unwrap();
+    let running = HostKnot::start(config).await.unwrap();
     let base = format!("http://{}", running.admin_addr());
     let browser = Client::builder()
         .redirect(Policy::none())
@@ -336,7 +336,7 @@ async fn external_drift_blocks_unbind_and_recovers_when_restored() {
     assert_eq!(created.status(), StatusCode::SEE_OTHER);
 
     // Simulate external tampering: the managed A record changes outside
-    // Hostknot's control.
+    // HostKnot's control.
     let managed_id = {
         let mut records = dns.records.lock().unwrap();
         let record = records
@@ -364,7 +364,9 @@ async fn external_drift_blocks_unbind_and_recovers_when_restored() {
         .await
         .unwrap();
     assert_eq!(drifted.status(), StatusCode::CONFLICT);
-    assert!(drifted.text().await.unwrap().contains("drift"));
+    let body = drifted.text().await.unwrap();
+    assert!(body.contains("DNS records changed outside HostKnot"));
+    assert!(body.contains("left everything untouched"));
     // The tampered external record must not have been touched.
     assert_eq!(
         dns.records
@@ -383,7 +385,8 @@ async fn external_drift_blocks_unbind_and_recovers_when_restored() {
         .text()
         .await
         .unwrap();
-    assert!(status_page.contains("Drifted"));
+    assert!(status_page.contains(r#"class="pill removing">Removing"#));
+    assert!(status_page.contains("DNS drift detected"));
 
     // Restore the record externally: reconciliation retries the revert and
     // finishes the removal on its own.
@@ -432,7 +435,6 @@ async fn create_binding(
             ("upstream_scheme", "http"),
             ("upstream_port", "8080"),
             ("proxied", "true"),
-            ("insecure_tls", "false"),
             ("replace_existing", if replace { "true" } else { "false" }),
         ])
         .send()

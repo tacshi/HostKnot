@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
-    provider::{DnsError, DnsIntent, DnsProvider, DnsReceipt, DnsRecord},
+    provider::{DnsError, DnsIntent, DnsPlan, DnsProvider, DnsReceipt, DnsRecord},
     store::{CloudflareConfiguration, Store},
 };
 
@@ -441,11 +441,61 @@ impl Cloudflare {
         }
         unreachable!("bounded retry loop always returns")
     }
+
+    async fn rollback_plan(&self, access_token: &str, plan: &DnsPlan) {
+        let current = match self
+            .records(access_token, &plan.zone_id, &plan.hostname)
+            .await
+        {
+            Ok(current) => current,
+            Err(error) => {
+                tracing::error!(%error, hostname = plan.hostname, "failed to inspect DNS state for rollback");
+                return;
+            }
+        };
+        let comment = managed_comment(&plan.binding_id);
+        for record in current.iter().filter(|record| {
+            record.comment.as_deref() == Some(comment.as_str())
+                && plan.public_ips.iter().any(|address| {
+                    record_matches_target(record, &plan.hostname, *address, plan.proxied)
+                })
+        }) {
+            if let Err(error) = self
+                .delete_record(access_token, &plan.zone_id, &record.id)
+                .await
+            {
+                tracing::error!(%error, record_id = record.id, "failed to remove a managed DNS record during rollback");
+            }
+        }
+        let current = self
+            .records(access_token, &plan.zone_id, &plan.hostname)
+            .await
+            .unwrap_or_default();
+        for record in &plan.replaced {
+            if current
+                .iter()
+                .any(|existing| records_match_except_id(existing, record))
+            {
+                continue;
+            }
+            let body = CreateRecord {
+                record_type: &record.record_type,
+                name: &record.name,
+                content: &record.content,
+                proxied: record.proxied,
+                ttl: record.ttl,
+                comment: record.comment.clone().unwrap_or_default(),
+            };
+            if let Err(error) = self.create_record(access_token, &plan.zone_id, &body).await {
+                tracing::error!(%error, record_id = record.id, "failed to restore a DNS record during rollback");
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl DnsProvider for Cloudflare {
-    async fn apply(&self, intent: &DnsIntent) -> Result<DnsReceipt> {
+    async fn prepare(&self, intent: &DnsIntent) -> Result<DnsPlan> {
         let access_token = self.access_token().await?;
         let zones = self.zones(&access_token).await?;
         let zone = zones
@@ -466,66 +516,100 @@ impl DnsProvider for Cloudflare {
         if !conflicting.is_empty() && !intent.replace_existing {
             return Err(DnsError::Conflict.into());
         }
-        if !conflicting.is_empty() {
-            // Persist the pre-image durably BEFORE anything is deleted, so a
-            // crash mid-replacement cannot silently lose the operator's
-            // original records.
-            self.store.record_event(
-                "dns",
-                &format!(
-                    "Replacing existing records for {}: {}",
-                    intent.hostname,
-                    serde_json::to_string(&conflicting)?
-                ),
-            )?;
-        }
-        for record in &conflicting {
-            self.delete_record(&access_token, &zone.id, &record.id)
-                .await?;
-        }
-        let mut created = Vec::new();
-        for public_ip in &intent.public_ips {
-            let record_type = if public_ip.is_ipv4() { "A" } else { "AAAA" };
-            let body = CreateRecord {
-                record_type,
-                name: &intent.hostname,
-                content: &public_ip.to_string(),
-                proxied: intent.proxied,
-                ttl: 1,
-                comment: format!("managed-by=hostknot binding={}", intent.binding_id),
-            };
-            match self.create_record(&access_token, &zone.id, &body).await {
-                Ok(record) => created.push(record),
-                Err(error) => {
-                    for record in &created {
-                        let _ = self
-                            .delete_record(&access_token, &zone.id, &record.id)
-                            .await;
-                    }
-                    for record in &conflicting {
-                        let body = CreateRecord {
-                            record_type: &record.record_type,
-                            name: &record.name,
-                            content: &record.content,
-                            proxied: record.proxied,
-                            ttl: record.ttl,
-                            comment: record.comment.clone().unwrap_or_default(),
-                        };
-                        if let Err(restore_error) =
-                            self.create_record(&access_token, &zone.id, &body).await
-                        {
-                            tracing::error!(%restore_error, record_id = record.id, "failed to restore DNS record after create failure");
-                        }
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        Ok(DnsReceipt {
+        Ok(DnsPlan {
+            binding_id: intent.binding_id.clone(),
+            hostname: intent.hostname.clone(),
+            public_ips: intent.public_ips.clone(),
+            proxied: intent.proxied,
             zone_id: zone.id,
             zone_name: zone.name,
-            created,
             replaced: conflicting,
+        })
+    }
+
+    async fn apply(&self, plan: &DnsPlan) -> Result<DnsReceipt> {
+        let access_token = self.access_token().await?;
+        let current = self
+            .records(&access_token, &plan.zone_id, &plan.hostname)
+            .await?;
+        let managed_comment = managed_comment(&plan.binding_id);
+        let conflicts = current
+            .iter()
+            .filter(|record| matches!(record.record_type.as_str(), "A" | "AAAA" | "CNAME"))
+            .collect::<Vec<_>>();
+        let mut created = Vec::new();
+        let mut delete_ids = Vec::new();
+
+        // Validate the current snapshot before mutating it. Records from the
+        // durable pre-image may have new IDs after a previous rollback, so
+        // identity is semantic; an unrelated new record is external drift.
+        for record in conflicts {
+            if record.comment.as_deref() == Some(managed_comment.as_str()) {
+                let is_target = plan.public_ips.iter().any(|address| {
+                    record_matches_target(record, &plan.hostname, *address, plan.proxied)
+                });
+                if !is_target {
+                    return Err(DnsError::Drift.into());
+                }
+                if !created.iter().any(|existing: &DnsRecord| {
+                    existing.record_type == record.record_type && existing.content == record.content
+                }) {
+                    created.push(record.clone());
+                } else {
+                    delete_ids.push(record.id.clone());
+                }
+                continue;
+            }
+            if plan
+                .replaced
+                .iter()
+                .any(|expected| records_match_except_id(record, expected))
+            {
+                delete_ids.push(record.id.clone());
+                continue;
+            }
+            return Err(DnsError::Drift.into());
+        }
+
+        let mutation: Result<()> = async {
+            for record_id in &delete_ids {
+                self.delete_record(&access_token, &plan.zone_id, record_id)
+                    .await?;
+            }
+            for address in &plan.public_ips {
+                let record_type = if address.is_ipv4() { "A" } else { "AAAA" };
+                let content = address.to_string();
+                if created
+                    .iter()
+                    .any(|record| record.record_type == record_type && record.content == content)
+                {
+                    continue;
+                }
+                let body = CreateRecord {
+                    record_type,
+                    name: &plan.hostname,
+                    content: &content,
+                    proxied: plan.proxied,
+                    ttl: 1,
+                    comment: managed_comment.clone(),
+                };
+                created.push(
+                    self.create_record(&access_token, &plan.zone_id, &body)
+                        .await?,
+                );
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = mutation {
+            self.rollback_plan(&access_token, plan).await;
+            return Err(error);
+        }
+        Ok(DnsReceipt {
+            zone_id: plan.zone_id.clone(),
+            zone_name: plan.zone_name.clone(),
+            created,
+            replaced: plan.replaced.clone(),
         })
     }
 
@@ -539,32 +623,48 @@ impl DnsProvider for Cloudflare {
         let current = self
             .records(&access_token, &receipt.zone_id, hostname)
             .await?;
+        // Validate every managed record before changing any of them. This
+        // keeps a genuine drift conflict side-effect-free.
         for managed in &receipt.created {
-            let unchanged = current.iter().any(|record| {
-                record.id == managed.id
-                    && record.record_type == managed.record_type
-                    && record.name == managed.name
-                    && record.content == managed.content
-                    && record.proxied == managed.proxied
-            });
-            if !unchanged {
+            let Some(current) = current.iter().find(|record| record.id == managed.id) else {
+                return Err(DnsError::Drift.into());
+            };
+            if current.record_type != managed.record_type
+                || current.name != managed.name
+                || current.content != managed.content
+                || current.ttl != managed.ttl
+                || !comments_match(&current.comment, &managed.comment)
+                || (current.proxied != managed.proxied && current.proxied != proxied)
+            {
                 return Err(DnsError::Drift.into());
             }
         }
         let mut updated = Vec::with_capacity(receipt.created.len());
-        for record in &receipt.created {
+        let mut changed_this_attempt = Vec::new();
+        for managed in &receipt.created {
+            let current = current
+                .iter()
+                .find(|record| record.id == managed.id)
+                .expect("managed records were validated above");
+            if current.proxied == proxied {
+                updated.push(current.clone());
+                continue;
+            }
             match self
-                .update_record(&access_token, &receipt.zone_id, record, proxied)
+                .update_record(&access_token, &receipt.zone_id, current, proxied)
                 .await
             {
-                Ok(record) => updated.push(record),
+                Ok(record) => {
+                    changed_this_attempt.push((record.clone(), managed));
+                    updated.push(record);
+                }
                 Err(error) => {
-                    for (changed, original) in updated.iter().zip(receipt.created.iter()) {
+                    for (changed, original) in changed_this_attempt {
                         if let Err(rollback_error) = self
                             .update_record(
                                 &access_token,
                                 &receipt.zone_id,
-                                changed,
+                                &changed,
                                 original.proxied,
                             )
                             .await
@@ -599,23 +699,49 @@ impl DnsProvider for Cloudflare {
         // that is simply absent is already reverted — our own earlier
         // deletion (double unbind, crash mid-revert) must not strand the
         // binding in a drift state.
+        if current.iter().any(|record| {
+            receipt.created.iter().any(|managed| {
+                managed.comment.as_deref().is_some_and(|comment| {
+                    !comment.is_empty() && record.comment.as_deref() == Some(comment)
+                })
+            }) && !receipt
+                .created
+                .iter()
+                .any(|managed| records_match_except_id(record, managed))
+        }) {
+            return Err(DnsError::Drift.into());
+        }
+        let mut delete_ids = Vec::new();
         for managed in &receipt.created {
             match current.iter().find(|record| record.id == managed.id) {
-                None => {}
-                Some(record)
-                    if record.record_type == managed.record_type
-                        && record.name == managed.name
-                        && record.content == managed.content
-                        && record.proxied == managed.proxied => {}
+                Some(record) if records_match_except_id(record, managed) => {
+                    delete_ids.push(record.id.clone());
+                }
                 Some(_) => return Err(DnsError::Drift.into()),
+                None => {
+                    // Cloudflare may assign a new ID when a record is
+                    // recreated during recovery. The binding-specific comment
+                    // plus full record semantics still identifies it as ours.
+                    if let Some(record) = current
+                        .iter()
+                        .find(|record| records_match_except_id(record, managed))
+                    {
+                        delete_ids.push(record.id.clone());
+                    }
+                }
             }
         }
-        for record in &receipt.created {
-            if current.iter().any(|existing| existing.id == record.id) {
-                self.delete_record(&access_token, &receipt.zone_id, &record.id)
-                    .await?;
-            }
+        delete_ids.sort_unstable();
+        delete_ids.dedup();
+        for record_id in delete_ids {
+            self.delete_record(&access_token, &receipt.zone_id, &record_id)
+                .await?;
         }
+        // Use a fresh snapshot: the old one still contains the records just
+        // deleted and could falsely look like an already-restored pre-image.
+        let current = self
+            .records(&access_token, &receipt.zone_id, hostname)
+            .await?;
         for record in &receipt.replaced {
             // Restore idempotently: an operator may already have re-created
             // the prior record by hand.
@@ -640,6 +766,37 @@ impl DnsProvider for Cloudflare {
         }
         Ok(())
     }
+}
+
+fn managed_comment(binding_id: &str) -> String {
+    format!("managed-by=hostknot binding={binding_id}")
+}
+
+fn record_matches_target(
+    record: &DnsRecord,
+    hostname: &str,
+    address: std::net::IpAddr,
+    proxied: bool,
+) -> bool {
+    record.record_type == if address.is_ipv4() { "A" } else { "AAAA" }
+        && record.name == hostname
+        && record.content == address.to_string()
+        && record.proxied == proxied
+        && record.ttl == 1
+}
+
+fn records_match_except_id(left: &DnsRecord, right: &DnsRecord) -> bool {
+    left.record_type == right.record_type
+        && left.name == right.name
+        && left.content == right.content
+        && left.proxied == right.proxied
+        && left.ttl == right.ttl
+        && comments_match(&left.comment, &right.comment)
+}
+
+fn comments_match(left: &Option<String>, right: &Option<String>) -> bool {
+    left.as_deref().filter(|comment| !comment.is_empty())
+        == right.as_deref().filter(|comment| !comment.is_empty())
 }
 
 fn normalize_scopes(scopes: &str) -> Result<String> {

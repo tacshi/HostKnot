@@ -1,3 +1,6 @@
+mod bindings;
+mod schema;
+
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
@@ -20,7 +23,7 @@ use subtle::ConstantTimeEq;
 
 use crate::clock::Clock;
 use crate::crypto::Vault;
-use crate::provider::DnsReceipt;
+use crate::model::Binding;
 
 #[derive(Clone)]
 pub struct Store {
@@ -55,20 +58,6 @@ pub struct OAuthAttempt {
     pub code_verifier: String,
 }
 
-#[derive(Clone, Debug)]
-pub struct Binding {
-    pub id: String,
-    pub hostname: String,
-    pub upstream_scheme: String,
-    pub upstream_port: u16,
-    pub proxied: bool,
-    pub status: String,
-    pub certificate_status: String,
-    pub health: String,
-    pub last_error: Option<String>,
-    pub replace_confirmed: bool,
-}
-
 pub struct StoredCertificate {
     pub identifier: String,
     pub certificate_pem: String,
@@ -97,99 +86,7 @@ impl Store {
         let connection = Connection::open(state_dir.join("hostknot.sqlite3"))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        let schema_version: i64 =
-            connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if schema_version > 2 {
-            bail!("state database schema {schema_version} is newer than this Hostknot binary");
-        }
-        if schema_version < 1 {
-            connection.execute_batch(
-                "
-            BEGIN IMMEDIATE;
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS administrator (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                password_hash TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS sessions (
-                token_hash BLOB PRIMARY KEY,
-                csrf_token TEXT NOT NULL,
-                expires_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL,
-                message TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS provider_configuration (
-                provider TEXT PRIMARY KEY,
-                client_id TEXT NOT NULL,
-                client_secret TEXT NOT NULL,
-                scopes TEXT NOT NULL,
-                access_token TEXT,
-                refresh_token TEXT,
-                token_expires_at INTEGER,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS oauth_attempts (
-                state_hash BLOB PRIMARY KEY,
-                provider TEXT NOT NULL,
-                code_verifier TEXT NOT NULL,
-                expires_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS bindings (
-                id TEXT PRIMARY KEY,
-                hostname TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                upstream_scheme TEXT NOT NULL,
-                upstream_port INTEGER NOT NULL,
-                insecure_tls INTEGER NOT NULL DEFAULT 0,
-                proxied INTEGER NOT NULL DEFAULT 1,
-                provider TEXT NOT NULL DEFAULT 'cloudflare',
-                zone_id TEXT,
-                dns_receipt TEXT,
-                status TEXT NOT NULL,
-                certificate_status TEXT NOT NULL,
-                health TEXT NOT NULL,
-                last_error TEXT,
-                drain_until INTEGER,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS certificates (
-                identifier TEXT PRIMARY KEY,
-                certificate_pem TEXT NOT NULL,
-                private_key_pem TEXT NOT NULL,
-                not_after INTEGER NOT NULL,
-                renew_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS secrets (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            PRAGMA user_version = 1;
-            COMMIT;
-            ",
-            )?;
-        }
-        if schema_version < 2 {
-            connection.execute_batch(
-                "
-            BEGIN IMMEDIATE;
-            ALTER TABLE oauth_attempts ADD COLUMN session_hash BLOB;
-            ALTER TABLE bindings ADD COLUMN replace_confirmed INTEGER NOT NULL DEFAULT 0;
-            PRAGMA user_version = 2;
-            COMMIT;
-            ",
-            )?;
-        }
-
+        schema::migrate(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             vault: Vault::new(master_key),
@@ -587,189 +484,10 @@ impl Store {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_binding(
-        &self,
-        id: &str,
-        hostname: &str,
-        upstream_scheme: &str,
-        upstream_port: u16,
-        insecure_tls: bool,
-        proxied: bool,
-        replace_confirmed: bool,
-    ) -> Result<Binding> {
-        self.connection()?.execute(
-            "INSERT INTO bindings(
-               id, hostname, upstream_scheme, upstream_port, insecure_tls, proxied,
-               replace_confirmed, status, certificate_status, health, created_at, updated_at
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'dns_pending', 'pending', 'unknown', ?8, ?8)",
-            params![
-                id,
-                hostname,
-                upstream_scheme,
-                upstream_port,
-                insecure_tls,
-                proxied,
-                replace_confirmed,
-                self.now()
-            ],
-        )?;
-        self.invalidate_routes();
-        self.binding(id)?
-            .context("newly inserted binding was not found")
-    }
-
-    pub fn binding(&self, id: &str) -> Result<Option<Binding>> {
-        Ok(self
-            .connection()?
-            .query_row(
-                "SELECT id, hostname, upstream_scheme, upstream_port, insecure_tls,
-                        proxied, status, certificate_status, health, last_error, replace_confirmed
-                 FROM bindings WHERE id = ?1",
-                [id],
-                binding_from_row,
-            )
-            .optional()?)
-    }
-
-    pub fn list_bindings(&self) -> Result<Vec<Binding>> {
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT id, hostname, upstream_scheme, upstream_port, insecure_tls,
-                    proxied, status, certificate_status, health, last_error, replace_confirmed
-             FROM bindings ORDER BY hostname",
-        )?;
-        let rows = statement.query_map([], binding_from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub fn active_binding(&self, hostname: &str) -> Result<Option<Binding>> {
-        let cache_key = hostname.to_ascii_lowercase();
-        if let Ok(cache) = self.route_cache.lock()
-            && let Some((cached_at, binding)) = cache.get(&cache_key)
-            && cached_at.elapsed() < ROUTE_CACHE_TTL
-        {
-            return Ok(binding.clone());
-        }
-        let binding = self
-            .connection()?
-            .query_row(
-                "SELECT id, hostname, upstream_scheme, upstream_port, insecure_tls,
-                        proxied, status, certificate_status, health, last_error, replace_confirmed
-                 FROM bindings
-                 WHERE hostname = ?1 AND status IN ('active', 'degraded', 'draining')",
-                [hostname],
-                binding_from_row,
-            )
-            .optional()?;
-        if let Ok(mut cache) = self.route_cache.lock() {
-            cache.insert(cache_key, (Instant::now(), binding.clone()));
-        }
-        Ok(binding)
-    }
-
     fn invalidate_routes(&self) {
         if let Ok(mut cache) = self.route_cache.lock() {
             cache.clear();
         }
-    }
-
-    pub fn hostname_is_routable(&self, hostname: &str) -> Result<bool> {
-        Ok(self.active_binding(hostname)?.is_some())
-    }
-
-    pub fn mark_binding_certificate_pending(&self, id: &str, receipt: &DnsReceipt) -> Result<()> {
-        self.connection()?.execute(
-            "UPDATE bindings SET zone_id = ?1, dns_receipt = ?2,
-               status = 'certificate_pending', certificate_status = 'pending',
-               last_error = NULL, updated_at = ?3 WHERE id = ?4",
-            params![
-                receipt.zone_id,
-                serde_json::to_string(receipt)?,
-                self.now(),
-                id
-            ],
-        )?;
-        self.invalidate_routes();
-        Ok(())
-    }
-
-    pub fn mark_binding_active(&self, id: &str) -> Result<()> {
-        self.connection()?.execute(
-            "UPDATE bindings SET status = 'active', certificate_status = 'active',
-               health = 'unknown', last_error = NULL, updated_at = ?1 WHERE id = ?2",
-            params![self.now(), id],
-        )?;
-        self.invalidate_routes();
-        Ok(())
-    }
-
-    pub fn mark_binding_error(&self, id: &str, status: &str, error: &str) -> Result<()> {
-        self.connection()?.execute(
-            "UPDATE bindings SET status = ?1, last_error = ?2, updated_at = ?3 WHERE id = ?4",
-            params![status, error, self.now(), id],
-        )?;
-        self.invalidate_routes();
-        Ok(())
-    }
-
-    pub fn update_binding(
-        &self,
-        id: &str,
-        upstream_scheme: &str,
-        upstream_port: u16,
-        insecure_tls: bool,
-        proxied: bool,
-        receipt: Option<&DnsReceipt>,
-    ) -> Result<()> {
-        self.connection()?.execute(
-            "UPDATE bindings SET upstream_scheme = ?1, upstream_port = ?2,
-               insecure_tls = ?3, proxied = ?4,
-               dns_receipt = COALESCE(?5, dns_receipt), updated_at = ?6
-             WHERE id = ?7",
-            params![
-                upstream_scheme,
-                upstream_port,
-                insecure_tls,
-                proxied,
-                receipt.map(serde_json::to_string).transpose()?,
-                self.now(),
-                id
-            ],
-        )?;
-        self.invalidate_routes();
-        Ok(())
-    }
-
-    pub fn binding_receipt(&self, id: &str) -> Result<Option<DnsReceipt>> {
-        let receipt: Option<String> = self
-            .connection()?
-            .query_row(
-                "SELECT dns_receipt FROM bindings WHERE id = ?1 AND dns_receipt IS NOT NULL",
-                [id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        receipt
-            .map(|receipt| serde_json::from_str(&receipt).context("decode DNS receipt"))
-            .transpose()
-    }
-
-    pub fn mark_binding_draining(&self, id: &str, duration: std::time::Duration) -> Result<()> {
-        self.connection()?.execute(
-            "UPDATE bindings SET status = 'draining', drain_until = ?1,
-               updated_at = ?2 WHERE id = ?3",
-            params![self.now() + duration.as_secs() as i64, self.now(), id],
-        )?;
-        self.invalidate_routes();
-        Ok(())
-    }
-
-    pub fn delete_binding(&self, id: &str) -> Result<()> {
-        self.connection()?
-            .execute("DELETE FROM bindings WHERE id = ?1", [id])?;
-        self.invalidate_routes();
-        Ok(())
     }
 
     pub fn save_certificate(
@@ -895,37 +613,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn draining_bindings(&self) -> Result<Vec<(String, String, i64)>> {
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT id, hostname, drain_until FROM bindings
-             WHERE status = 'draining' AND drain_until IS NOT NULL",
-        )?;
-        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub fn update_binding_health(
-        &self,
-        id: &str,
-        healthy: bool,
-        error: Option<&str>,
-    ) -> Result<()> {
-        let (health, status) = if healthy {
-            ("healthy", "active")
-        } else {
-            ("unavailable", "degraded")
-        };
-        self.connection()?.execute(
-            "UPDATE bindings SET health = ?1,
-               status = CASE WHEN status IN ('active', 'degraded') THEN ?2 ELSE status END,
-               last_error = ?3, updated_at = ?4 WHERE id = ?5",
-            params![health, status, error, self.now(), id],
-        )?;
-        self.invalidate_routes();
-        Ok(())
-    }
-
     pub fn record_event(&self, kind: &str, message: &str) -> Result<()> {
         let connection = self.connection()?;
         connection.execute(
@@ -959,21 +646,6 @@ impl Store {
             .lock()
             .map_err(|_| anyhow::anyhow!("state database mutex is poisoned"))
     }
-}
-
-fn binding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Binding> {
-    Ok(Binding {
-        id: row.get(0)?,
-        hostname: row.get(1)?,
-        upstream_scheme: row.get(2)?,
-        upstream_port: row.get(3)?,
-        proxied: row.get(5)?,
-        status: row.get(6)?,
-        certificate_status: row.get(7)?,
-        health: row.get(8)?,
-        last_error: row.get(9)?,
-        replace_confirmed: row.get(10)?,
-    })
 }
 
 fn random_token() -> String {
@@ -1034,4 +706,87 @@ fn set_dir_permissions(path: &Path) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::BindingStatus;
+
+    #[test]
+    fn schema_v3_migrates_retryable_removals_and_rejects_invalid_states() {
+        let state = tempfile::TempDir::new().unwrap();
+        ensure_master_key(&state.path().join("master.key")).unwrap();
+        let connection = Connection::open(state.path().join("hostknot.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE bindings (
+                    id TEXT PRIMARY KEY,
+                    hostname TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    upstream_scheme TEXT NOT NULL,
+                    upstream_port INTEGER NOT NULL,
+                    insecure_tls INTEGER NOT NULL DEFAULT 0,
+                    proxied INTEGER NOT NULL DEFAULT 1,
+                    provider TEXT NOT NULL DEFAULT 'cloudflare',
+                    zone_id TEXT,
+                    dns_receipt TEXT,
+                    status TEXT NOT NULL,
+                    certificate_status TEXT NOT NULL,
+                    health TEXT NOT NULL,
+                    last_error TEXT,
+                    drain_until INTEGER,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    replace_confirmed INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO bindings(
+                    id, hostname, upstream_scheme, upstream_port, status,
+                    certificate_status, health, created_at, updated_at
+                ) VALUES(
+                    'b1', 'app.example.com', 'http', 8080, 'drifted',
+                    'active', 'healthy', 1, 1
+                );
+                PRAGMA user_version = 2;
+                ",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(state.path()).unwrap();
+        assert_eq!(
+            store.binding("b1").unwrap().unwrap().status,
+            BindingStatus::Removing
+        );
+        assert!(store.binding_dns_plan("b1").unwrap().is_none());
+        assert!(
+            store
+                .connection()
+                .unwrap()
+                .execute("UPDATE bindings SET status = 'typo' WHERE id = 'b1'", [])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn health_updates_do_not_overwrite_transitional_operation_errors() {
+        let state = tempfile::TempDir::new().unwrap();
+        let store = Store::open(state.path()).unwrap();
+        store
+            .create_binding("b1", "app.example.com", "http", 8080, false, false)
+            .unwrap();
+        store.mark_binding_active("b1").unwrap();
+        store.begin_binding_removal("b1").unwrap();
+        store
+            .mark_binding_error("b1", BindingStatus::Removing, "DNS drift")
+            .unwrap();
+
+        store
+            .update_binding_health("b1", false, Some("upstream failed"))
+            .unwrap();
+
+        let binding = store.binding("b1").unwrap().unwrap();
+        assert_eq!(binding.status, BindingStatus::Removing);
+        assert_eq!(binding.last_error.as_deref(), Some("DNS drift"));
+    }
 }
