@@ -29,13 +29,17 @@ pub(super) fn binding_edit_page(
     let hostname = escape_html(&binding.hostname);
     let binding_id = escape_html(&binding.id);
     let csrf = escape_html(csrf);
-    let http_selected = (binding.upstream_scheme == "http")
-        .then_some(" selected")
-        .unwrap_or_default();
-    let https_selected = (binding.upstream_scheme == "https")
-        .then_some(" selected")
-        .unwrap_or_default();
-    let proxied = binding.proxied.then_some(" checked").unwrap_or_default();
+    let http_selected = if binding.upstream_scheme == "http" {
+        " selected"
+    } else {
+        ""
+    };
+    let https_selected = if binding.upstream_scheme == "https" {
+        " selected"
+    } else {
+        ""
+    };
+    let proxied = if binding.proxied { " checked" } else { "" };
     let upstream_port = binding.upstream_port;
     let path_routes = path_routes_section(&binding_id, routes, &csrf);
 
