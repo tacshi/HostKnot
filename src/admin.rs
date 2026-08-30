@@ -22,12 +22,12 @@ use self::security::{
     require_csrf, security_headers, session_redirect,
 };
 use self::views::{
-    HtmlStatus, discover_listening_ports, error_page, escape_html, format_timestamp, page,
-    page_with_head, title_status,
+    HtmlStatus, binding_edit_page, discover_listening_ports, error_page, escape_html,
+    format_timestamp, page, page_with_head, title_status,
 };
 
 use crate::{
-    bindings::{BindingManager, CreateBinding, UpdateBinding},
+    bindings::{BindingManager, CreateBinding, CreatePathRoute, UpdateBinding, UpdatePathRoute},
     certificates::CertificateResolver,
     cloudflare::{Cloudflare, CloudflareEndpoints},
     model::BindingStatus,
@@ -82,6 +82,22 @@ pub fn router(state: Arc<AdminState>) -> Router {
         .route("/bindings/{id}/edit", get(edit_binding_page))
         .route("/bindings/{id}", axum::routing::post(update_binding))
         .route("/bindings/{id}/remove", axum::routing::post(remove_binding))
+        .route(
+            "/bindings/{id}/routes",
+            axum::routing::post(create_path_route),
+        )
+        .route(
+            "/bindings/{binding_id}/routes/{route_id}/edit",
+            get(edit_path_route_page),
+        )
+        .route(
+            "/bindings/{binding_id}/routes/{route_id}",
+            axum::routing::post(update_path_route),
+        )
+        .route(
+            "/bindings/{binding_id}/routes/{route_id}/remove",
+            axum::routing::post(remove_path_route),
+        )
         .route("/providers/cloudflare", get(cloudflare_page))
         .route(
             "/providers/cloudflare/configure",
@@ -637,28 +653,17 @@ async fn edit_binding_page(
     let Some(binding) = state.store.binding(&id).ok().flatten() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let http_selected = if binding.upstream_scheme == "http" {
-        " selected"
-    } else {
-        ""
+    let routes = match state.bindings.list_path_routes(&binding.id) {
+        Ok(routes) => routes,
+        Err(error) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Couldn't load path routes",
+                &error.to_string(),
+            );
+        }
     };
-    let https_selected = if binding.upstream_scheme == "https" {
-        " selected"
-    } else {
-        ""
-    };
-    let proxied = if binding.proxied { " checked" } else { "" };
-    Html(page(
-        "Edit binding",
-        &format!(
-            r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">EDIT ROUTE</span><h1>{}</h1><p>Hostnames are immutable. Create a replacement binding to use a different hostname.</p><form method="post" action="/bindings/{}"><input type="hidden" name="csrf" value="{}"><div class="managed-tls"><strong>Public HTTPS is automatic</strong><span>These settings only control the connection to the local service.</span></div><label>Local service protocol<select name="upstream_scheme"><option value="http"{http_selected}>HTTP</option><option value="https"{https_selected}>HTTPS</option></select><small class="form-help">Private and self-signed loopback certificates are accepted automatically.</small></label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" value="{}" required></label><label class="check"><input name="proxied" type="checkbox" value="true"{proxied}> Enable Cloudflare proxy</label><button type="submit">Save changes</button></form></main>"#,
-            escape_html(&binding.hostname),
-            binding.id,
-            escape_html(&csrf),
-            binding.upstream_port,
-        ),
-    ))
-    .into_response()
+    Html(binding_edit_page(&binding, &routes, &csrf)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -701,6 +706,130 @@ async fn update_binding(
         Err(error) => error_page(
             StatusCode::BAD_REQUEST,
             "Couldn't apply that change",
+            &error.to_string(),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct PathRouteForm {
+    csrf: String,
+    path_prefix: String,
+    upstream_scheme: String,
+    upstream_port: u16,
+}
+
+async fn create_path_route(
+    State(state): State<Arc<AdminState>>,
+    Path(binding_id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<PathRouteForm>,
+) -> Response {
+    if let Some(rejection) = require_csrf(&state, &headers, &form.csrf) {
+        return rejection;
+    }
+    match state.bindings.create_path_route(
+        &binding_id,
+        CreatePathRoute {
+            path_prefix: form.path_prefix,
+            upstream_scheme: form.upstream_scheme,
+            upstream_port: form.upstream_port,
+        },
+    ) {
+        Ok(_) => Redirect::to(&format!("/bindings/{binding_id}/edit")).into_response(),
+        Err(error) => error_page(
+            StatusCode::BAD_REQUEST,
+            "Couldn't add that path route",
+            &error.to_string(),
+        ),
+    }
+}
+
+async fn edit_path_route_page(
+    State(state): State<Arc<AdminState>>,
+    Path((binding_id, route_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(csrf) = authenticated_csrf(&state.store, &headers) else {
+        return Redirect::to("/login").into_response();
+    };
+    let Some(binding) = state.store.binding(&binding_id).ok().flatten() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(route) = state.store.path_route(&route_id).ok().flatten() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if route.binding_id != binding.id {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let http_selected = if route.upstream_scheme == "http" {
+        " selected"
+    } else {
+        ""
+    };
+    let https_selected = if route.upstream_scheme == "https" {
+        " selected"
+    } else {
+        ""
+    };
+    Html(page(
+        "Edit path route",
+        &format!(
+            r#"<main class="narrow"><a href="/bindings/{}/edit">← {}</a><span class="eyebrow block">EDIT PATH ROUTE</span><h1>{}</h1><form method="post" action="/bindings/{}/routes/{}"><input type="hidden" name="csrf" value="{}"><label>Path prefix<input name="path_prefix" value="{}" required><small class="form-help">The complete request path is preserved. Trailing slashes are normalized.</small></label><label>Local service protocol<select name="upstream_scheme"><option value="http"{http_selected}>HTTP</option><option value="https"{https_selected}>HTTPS</option></select></label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" value="{}" required></label><button type="submit">Save path route</button></form></main>"#,
+            binding.id,
+            escape_html(&binding.hostname),
+            escape_html(&route.path_prefix),
+            binding.id,
+            route.id,
+            escape_html(&csrf),
+            escape_html(&route.path_prefix),
+            route.upstream_port,
+        ),
+    ))
+    .into_response()
+}
+
+async fn update_path_route(
+    State(state): State<Arc<AdminState>>,
+    Path((binding_id, route_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Form(form): Form<PathRouteForm>,
+) -> Response {
+    if let Some(rejection) = require_csrf(&state, &headers, &form.csrf) {
+        return rejection;
+    }
+    match state.bindings.update_path_route(
+        &binding_id,
+        &route_id,
+        UpdatePathRoute {
+            path_prefix: form.path_prefix,
+            upstream_scheme: form.upstream_scheme,
+            upstream_port: form.upstream_port,
+        },
+    ) {
+        Ok(()) => Redirect::to(&format!("/bindings/{binding_id}/edit")).into_response(),
+        Err(error) => error_page(
+            StatusCode::BAD_REQUEST,
+            "Couldn't update that path route",
+            &error.to_string(),
+        ),
+    }
+}
+
+async fn remove_path_route(
+    State(state): State<Arc<AdminState>>,
+    Path((binding_id, route_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    if let Some(rejection) = require_csrf(&state, &headers, &form.csrf) {
+        return rejection;
+    }
+    match state.bindings.delete_path_route(&binding_id, &route_id) {
+        Ok(()) => Redirect::to(&format!("/bindings/{binding_id}/edit")).into_response(),
+        Err(error) => error_page(
+            StatusCode::BAD_REQUEST,
+            "Couldn't remove that path route",
             &error.to_string(),
         ),
     }

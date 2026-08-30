@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, Method},
     response::Response,
     routing::{any, get, post},
 };
@@ -26,6 +26,8 @@ enum ProxyScenario {
     Forwarding,
     UpdatesAndHealth,
     ProtocolsAndRestart,
+    PathRoutes,
+    PathRouteAdministration,
 }
 
 #[tokio::test]
@@ -41,6 +43,16 @@ async fn binding_updates_upstreams_proxy_mode_and_health() {
 #[tokio::test]
 async fn binding_supports_websockets_redirects_and_certificate_restart() {
     run_proxy_scenario(ProxyScenario::ProtocolsAndRestart).await;
+}
+
+#[tokio::test]
+async fn binding_routes_matching_paths_to_a_secondary_service() {
+    run_proxy_scenario(ProxyScenario::PathRoutes).await;
+}
+
+#[tokio::test]
+async fn binding_path_routes_are_validated_and_managed_through_the_admin_ui() {
+    run_proxy_scenario(ProxyScenario::PathRouteAdministration).await;
 }
 
 async fn run_proxy_scenario(scenario: ProxyScenario) {
@@ -95,6 +107,14 @@ async fn run_proxy_scenario(scenario: ProxyScenario) {
                     .body(Body::from_stream(stream))
                     .unwrap()
             }),
+        )
+        .route(
+            "/assets/item.txt",
+            get(|| async { "default upstream must not be used" }),
+        )
+        .route(
+            "/assets-old/item.txt",
+            get(|| async { "default neighboring path" }),
         );
     let upstream_task = tokio::spawn(async move {
         axum::serve(upstream_listener, upstream).await.unwrap();
@@ -266,9 +286,514 @@ async fn run_proxy_scenario(scenario: ProxyScenario) {
         ProxyScenario::ProtocolsAndRestart => {
             assert_protocols_and_restart(running, config, &proxy).await;
         }
+        ProxyScenario::PathRoutes => {
+            assert_path_routing(running, config, &browser, &proxy, &app_binding_id).await;
+        }
+        ProxyScenario::PathRouteAdministration => {
+            assert_path_route_administration(&browser, &base, &app_binding_id).await;
+            running.shutdown().await;
+        }
     }
     provider_task.abort();
     upstream_task.abort();
+}
+
+async fn assert_path_route_administration(browser: &Client, base: &str, binding_id: &str) {
+    let edit_page = browser
+        .get(format!("{base}/bindings/{binding_id}/edit"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = hidden_value(&edit_page, "csrf");
+
+    let rejected_csrf = browser
+        .post(format!("{base}/bindings/{binding_id}/routes"))
+        .form(&[
+            ("csrf", "invalid"),
+            ("path_prefix", "/assets"),
+            ("upstream_scheme", "http"),
+            ("upstream_port", "8080"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected_csrf.status(), StatusCode::FORBIDDEN);
+
+    for invalid_prefix in [
+        "/",
+        "assets",
+        "/assets//private",
+        "/assets/../private",
+        "/assets%2Fprivate",
+        "/assets?version=1",
+    ] {
+        let rejected = browser
+            .post(format!("{base}/bindings/{binding_id}/routes"))
+            .form(&[
+                ("csrf", csrf.as_str()),
+                ("path_prefix", invalid_prefix),
+                ("upstream_scheme", "http"),
+                ("upstream_port", "8080"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let invalid_scheme = browser
+        .post(format!("{base}/bindings/{binding_id}/routes"))
+        .form(&[
+            ("csrf", csrf.as_str()),
+            ("path_prefix", "/assets"),
+            ("upstream_scheme", "ftp"),
+            ("upstream_port", "8080"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_scheme.status(), StatusCode::BAD_REQUEST);
+
+    let reserved_port = Url::parse(base).unwrap().port().unwrap().to_string();
+    let reserved = browser
+        .post(format!("{base}/bindings/{binding_id}/routes"))
+        .form(&[
+            ("csrf", csrf.as_str()),
+            ("path_prefix", "/assets"),
+            ("upstream_scheme", "http"),
+            ("upstream_port", reserved_port.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reserved.status(), StatusCode::BAD_REQUEST);
+
+    create_path_route(browser, base, binding_id, "/assets/", "http", 8080).await;
+    let page = browser
+        .get(format!("{base}/bindings/{binding_id}/edit"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("<code>/assets</code>"));
+    let route_id = data_value(&page, "route-id");
+
+    let duplicate = browser
+        .post(format!("{base}/bindings/{binding_id}/routes"))
+        .form(&[
+            ("csrf", hidden_value(&page, "csrf")),
+            ("path_prefix", "/assets".to_owned()),
+            ("upstream_scheme", "http".to_owned()),
+            ("upstream_port", "8081".to_owned()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+
+    let route_page = browser
+        .get(format!(
+            "{base}/bindings/{binding_id}/routes/{route_id}/edit"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let updated = browser
+        .post(format!("{base}/bindings/{binding_id}/routes/{route_id}"))
+        .form(&[
+            ("csrf", hidden_value(&route_page, "csrf")),
+            ("path_prefix", "/static/".to_owned()),
+            ("upstream_scheme", "https".to_owned()),
+            ("upstream_port", "8443".to_owned()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::SEE_OTHER);
+
+    let updated_page = browser
+        .get(format!("{base}/bindings/{binding_id}/edit"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(updated_page.contains("<code>/static</code>"));
+    assert!(updated_page.contains("https://127.0.0.1:8443"));
+
+    let removed = browser
+        .post(format!(
+            "{base}/bindings/{binding_id}/routes/{route_id}/remove"
+        ))
+        .form(&[("csrf", hidden_value(&updated_page, "csrf"))])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), StatusCode::SEE_OTHER);
+    let final_page = browser
+        .get(format!("{base}/bindings/{binding_id}/edit"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!final_page.contains("data-route-id"));
+
+    let dashboard = browser
+        .get(base)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(dashboard.contains("Path route added: app.example.com/assets → http://127.0.0.1:8080"));
+    assert!(dashboard.contains(
+        "Path route updated: app.example.com/assets → app.example.com/static (https://127.0.0.1:8443)"
+    ));
+    assert!(
+        dashboard.contains("Path route removed: app.example.com/static (https://127.0.0.1:8443)")
+    );
+}
+
+async fn assert_path_routing(
+    running: RunningHostKnot,
+    config: Config,
+    browser: &Client,
+    proxy: &Client,
+    binding_id: &str,
+) {
+    let base = format!("http://{}", running.admin_addr());
+    let before_route = proxy
+        .get(format!("https://{}/assets/item.txt", running.https_addr()))
+        .header("host", "app.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        before_route.text().await.unwrap(),
+        "default upstream must not be used"
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        let service = Router::new()
+            .route("/assets", get(|| async { "exact path prefix" }))
+            .route(
+                "/assets/item.txt",
+                get(
+                    |uri: axum::extract::OriginalUri| async move { format!("secondary:{}", uri.0) },
+                ),
+            )
+            .route(
+                "/assets/echo",
+                post(|body: String| async move { format!("echo:{body}") }),
+            )
+            .route(
+                "/assets/range.bin",
+                any(|method: Method, headers: HeaderMap| async move {
+                    let mut response = if method == Method::HEAD {
+                        Response::builder()
+                            .header("content-length", "4")
+                            .body(Body::empty())
+                            .unwrap()
+                    } else if headers.get("range").and_then(|value| value.to_str().ok())
+                        == Some("bytes=1-2")
+                    {
+                        Response::builder()
+                            .status(StatusCode::PARTIAL_CONTENT)
+                            .header("content-range", "bytes 1-2/4")
+                            .header("content-length", "2")
+                            .body(Body::from("bc"))
+                            .unwrap()
+                    } else {
+                        Response::builder()
+                            .header("content-length", "4")
+                            .body(Body::from("abcd"))
+                            .unwrap()
+                    };
+                    response
+                        .headers_mut()
+                        .insert("accept-ranges", "bytes".parse().unwrap());
+                    response
+                }),
+            )
+            .route(
+                "/assets/ws",
+                get(|upgrade: axum::extract::WebSocketUpgrade| async move {
+                    upgrade.on_upgrade(|mut socket| async move {
+                        if let Some(Ok(message)) = socket.recv().await {
+                            let _ = socket.send(message).await;
+                        }
+                    })
+                }),
+            )
+            .route(
+                "/assets/events",
+                get(|| async {
+                    let stream = futures_util::stream::unfold(0_u8, |state| async move {
+                        match state {
+                            0 => Some((
+                                Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(
+                                    b"data: routed-first\n\n",
+                                )),
+                                1,
+                            )),
+                            1 => {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                Some((Ok(bytes::Bytes::from_static(b"data: routed-second\n\n")), 2))
+                            }
+                            _ => None,
+                        }
+                    });
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }),
+            );
+        axum::serve(listener, service).await.unwrap();
+    });
+
+    create_path_route(browser, &base, binding_id, "/assets/", "http", port).await;
+
+    let routed = proxy
+        .get(format!(
+            "https://{}/assets/item.txt?revision=7",
+            running.https_addr()
+        ))
+        .header("host", "app.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(routed.status(), StatusCode::OK);
+    assert_eq!(
+        routed.text().await.unwrap(),
+        "secondary:/assets/item.txt?revision=7"
+    );
+    let exact = proxy
+        .get(format!("https://{}/assets", running.https_addr()))
+        .header("host", "app.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(exact.text().await.unwrap(), "exact path prefix");
+
+    let echoed = proxy
+        .post(format!("https://{}/assets/echo", running.https_addr()))
+        .header("host", "app.example.com")
+        .body("request body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(echoed.text().await.unwrap(), "echo:request body");
+
+    let partial = proxy
+        .get(format!("https://{}/assets/range.bin", running.https_addr()))
+        .header("host", "app.example.com")
+        .header("range", "bytes=1-2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(partial.headers()["content-range"], "bytes 1-2/4");
+    assert_eq!(partial.text().await.unwrap(), "bc");
+
+    let head = proxy
+        .head(format!("https://{}/assets/range.bin", running.https_addr()))
+        .header("host", "app.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(head.headers()["accept-ranges"], "bytes");
+    assert!(head.bytes().await.unwrap().is_empty());
+
+    let streaming = proxy
+        .get(format!("https://{}/assets/events", running.https_addr()))
+        .header("host", "app.example.com")
+        .send()
+        .await
+        .unwrap();
+    let mut events = streaming.bytes_stream();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), events.next())
+        .await
+        .expect("first routed event is streamed without waiting")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, "data: routed-first\n\n");
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), events.next())
+        .await
+        .expect("second routed event is streamed")
+        .unwrap()
+        .unwrap();
+    assert_eq!(second, "data: routed-second\n\n");
+
+    let websocket_request = format!("wss://{}/assets/ws", running.https_addr())
+        .into_client_request()
+        .unwrap();
+    let (mut websocket, _) = tokio_tungstenite::connect_async_tls_with_config(
+        with_host(websocket_request, "app.example.com"),
+        None,
+        false,
+        Some(tokio_tungstenite::Connector::Rustls(insecure_tls_client())),
+    )
+    .await
+    .expect("WebSocket upgrade through a path route");
+    websocket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            "path ping".into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        websocket
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap(),
+        "path ping"
+    );
+
+    let nested_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let nested_port = nested_listener.local_addr().unwrap().port();
+    let nested_task = tokio::spawn(async move {
+        axum::serve(
+            nested_listener,
+            Router::new().route(
+                "/assets/private/item.txt",
+                get(|| async { "most specific upstream" }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    create_path_route(
+        browser,
+        &base,
+        binding_id,
+        "/assets/private",
+        "http",
+        nested_port,
+    )
+    .await;
+    let nested = proxy
+        .get(format!(
+            "https://{}/assets/private/item.txt",
+            running.https_addr()
+        ))
+        .header("host", "app.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nested.text().await.unwrap(), "most specific upstream");
+
+    let neighboring = proxy
+        .get(format!(
+            "https://{}/assets-old/item.txt",
+            running.https_addr()
+        ))
+        .header("host", "app.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        neighboring.text().await.unwrap(),
+        "default neighboring path"
+    );
+
+    let (https_port, https_task) = tls_upstream().await;
+    create_path_route(browser, &base, binding_id, "/secure", "https", https_port).await;
+    let secure = proxy
+        .get(format!("https://{}/secure", running.https_addr()))
+        .header("host", "app.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(secure.text().await.unwrap(), "secure upstream");
+
+    let fallback = proxy
+        .get(format!("https://{}/hello", running.https_addr()))
+        .header("host", "app.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fallback.status(), StatusCode::OK);
+    assert!(
+        fallback
+            .text()
+            .await
+            .unwrap()
+            .contains("host=app.example.com")
+    );
+
+    running.shutdown().await;
+    let restarted = HostKnot::start(config).await.unwrap();
+    let after_restart = proxy
+        .get(format!(
+            "https://{}/assets/item.txt?revision=8",
+            restarted.https_addr()
+        ))
+        .header("host", "app.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after_restart.text().await.unwrap(),
+        "secondary:/assets/item.txt?revision=8"
+    );
+
+    task.abort();
+    let failed = proxy
+        .get(format!(
+            "https://{}/assets/item.txt",
+            restarted.https_addr()
+        ))
+        .header("host", "app.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(failed.text().await.unwrap(), "Upstream unavailable");
+
+    let restarted_base = format!("http://{}", restarted.admin_addr());
+    let dashboard = browser
+        .get(&restarted_base)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(dashboard.contains("Active"));
+    assert!(!dashboard.contains("Degraded"));
+    let edit_page = browser
+        .get(format!("{restarted_base}/bindings/{binding_id}/edit"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(edit_page.contains("Unavailable"));
+    assert!(edit_page.contains("HTTP upstream failed"));
+
+    restarted.shutdown().await;
+    nested_task.abort();
+    https_task.abort();
 }
 
 async fn assert_forwarding_and_streaming(running: &RunningHostKnot, proxy: &Client) {
@@ -519,6 +1044,36 @@ async fn create_binding(browser: &Client, base: &str, hostname: &str, scheme: &s
             ("upstream_port", port.to_string()),
             ("proxied", "true".to_owned()),
             ("replace_existing", "false".to_owned()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+}
+
+async fn create_path_route(
+    browser: &Client,
+    base: &str,
+    binding_id: &str,
+    path_prefix: &str,
+    scheme: &str,
+    port: u16,
+) {
+    let page = browser
+        .get(format!("{base}/bindings/{binding_id}/edit"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let response = browser
+        .post(format!("{base}/bindings/{binding_id}/routes"))
+        .form(&[
+            ("csrf", hidden_value(&page, "csrf")),
+            ("path_prefix", path_prefix.to_owned()),
+            ("upstream_scheme", scheme.to_owned()),
+            ("upstream_port", port.to_string()),
         ])
         .send()
         .await

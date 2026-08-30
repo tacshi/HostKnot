@@ -4,7 +4,7 @@
 
 HostKnot is a single Rust binary that turns "I deployed a service on port 3000, now I want `app.example.com` pointing at it with HTTPS" into a two-minute browser workflow. It combines four things that normally require separate tools:
 
-- **A reverse proxy** on ports 80/443 with exact-host routing, HTTP/2, WebSockets, server-sent events, and streaming.
+- **A reverse proxy** on ports 80/443 with exact-host and optional path-prefix routing, HTTP/2, WebSockets, server-sent events, and streaming.
 - **Automatic DNS** through your Cloudflare account (OAuth-authorized, no API token pasting), with safe conflict handling and rollback on unbind.
 - **Automatic certificates** from Let's Encrypt — including a short-lived IP certificate so even the admin UI at `https://<your-ip>:9443` is served over trusted TLS.
 - **A browser admin UI** rendered entirely from the binary: no CDN, no Node.js, no frontend build.
@@ -20,6 +20,7 @@ Browser ──▶ https://<VPS-IP>:9443  (admin UI: bind app.example.com → :30
                     └─▶ Let's Encrypt    issues the certificate (HTTP-01)
 
 Visitors ─▶ https://app.example.com ──▶ HostKnot :443 ──▶ 127.0.0.1:3000
+                                      └─▶ /assets/* ──▶ 127.0.0.1:8080
 ```
 
 ## Requirements
@@ -66,10 +67,14 @@ It looks like `https://<YOUR_VPS_IP>:9443/setup?token=...`. The token is single-
 
 **5. Bind a domain.** Click **New binding**, pick a discovered local port (or type one), enter the hostname, and bind. HostKnot creates the DNS records, obtains the certificate, and starts routing — typically within seconds. Most local apps speak plain HTTP; leave the protocol on its HTTP default and HostKnot still serves the public side over HTTPS.
 
+**6. Add path routes when needed.** Edit an active binding to send a path such as `/assets` to another loopback service. HostKnot preserves the full request path and query; all unmatched requests continue to use the binding's default upstream.
+
 ## What to expect from bindings
 
-- **Exact hostnames only.** `app.example.com` matches `app.example.com` — no wildcards, no path routing. Hostnames are immutable; to rename, create a replacement binding.
-- **Editable after creation:** the local port and protocol, and the Cloudflare proxied/DNS-only mode.
+- **Exact hostnames only.** `app.example.com` matches `app.example.com` — no wildcard hosts. Hostnames are immutable; to rename, create a replacement binding.
+- **Optional longest-prefix routes.** `/assets` matches `/assets` and `/assets/...`, but not `/assets-old`. Overlapping routes are allowed and the most specific match wins. Prefixes are preserved rather than stripped or rewritten.
+- **Editable after creation:** the default local port and protocol, Cloudflare proxied/DNS-only mode, and secondary path routes.
+- **Failures stay isolated.** If a matched path route is unavailable, HostKnot returns an opaque 502 and does not retry against the default upstream. Each path route reports health independently.
 - **Certificate hiccups don't dead-end.** If issuance is delayed (DNS propagation, a busy CA), the binding shows *Certificate pending* on the dashboard and retries in the background with backoff — no action needed.
 - **Conflicts need confirmation.** If the hostname already has A/AAAA/CNAME records, HostKnot asks before replacing them, saves the originals, and restores them on unbind.
 - **Drift is never destroyed.** If someone changes the records outside HostKnot, unbinding stops and reports the drift instead of overwriting external changes; once resolved, removal completes automatically.
@@ -128,7 +133,7 @@ Reinstalls never touch an existing config, so a changed VPS address is a manual 
 - **Least privilege.** The systemd unit runs under a private dynamic user with `CAP_NET_BIND_SERVICE` as its only capability, a read-only host filesystem, and a writable state directory.
 - **Encrypted at rest.** OAuth secrets and tokens, ACME account credentials, and certificate keys are sealed with XChaCha20-Poly1305 under a mode-`0600` master key (context-bound so ciphertexts can't be swapped between columns). The service refuses to start if the key is readable by other users. Only Argon2id hashes are stored for the admin password.
 - **Hardened admin surface.** HTTPS with a trusted IP certificate, HTTP-only same-site session cookies, per-session CSRF tokens with origin checks, per-IP login throttling, expiring single-use setup/reset tokens, OAuth state bound to the initiating session (PKCE S256), and strict security headers.
-- **Contained proxying.** Upstreams are pinned to loopback — the proxy cannot be pointed at arbitrary hosts. Inbound `X-Forwarded-*` headers are overwritten, hop-by-hop headers are stripped, and upstream failures return an opaque 502. For HTTPS upstreams, private and self-signed certificates are accepted automatically: that hop never leaves the machine, while the public-facing side always serves real, verified certificates. `CF-Connecting-IP` is honored only from verified Cloudflare edge addresses and stripped from everything else.
+- **Contained proxying.** Default and path-route upstreams are pinned to loopback — the proxy cannot be pointed at arbitrary hosts. Inbound `X-Forwarded-*` headers are overwritten, hop-by-hop headers are stripped, and upstream failures return an opaque 502. For HTTPS upstreams, private and self-signed certificates are accepted automatically: that hop never leaves the machine, while the public-facing side always serves real, verified certificates. `CF-Connecting-IP` is honored only from verified Cloudflare edge addresses and stripped from everything else.
 
 ## Troubleshooting
 
@@ -145,6 +150,7 @@ Common gotchas:
 - **An upgrade "didn't take"** — run `hostknot version`; if it still shows the old version, the install step failed before the restart (its error is easy to miss in a `&&` chain). Re-run the installer and check its output.
 - **Admin forms rejected, DNS records or the admin certificate using a wrong address** — the config still holds the IP from the *first* install; see "Changing the public IP" above.
 - **A binding 502s immediately** — check the upstream protocol on the binding: an HTTPS upstream setting against an app that speaks plain HTTP fails the TLS handshake. Most local apps want HTTP.
+- **Only one path returns 502** — edit the binding and inspect that path route's protocol, port, and independent health status. Matched route failures intentionally do not fall back to the default service.
 
 ## Development
 

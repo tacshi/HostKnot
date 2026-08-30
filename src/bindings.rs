@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     certificates::CertificateResolver,
-    model::{Binding, BindingStatus, PendingBindingUpdate},
+    model::{Binding, BindingPathRoute, BindingStatus, PendingBindingUpdate},
     provider::{DnsIntent, DnsProvider},
     store::Store,
 };
@@ -48,6 +48,20 @@ pub struct UpdateBinding {
     pub proxied: bool,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct CreatePathRoute {
+    pub path_prefix: String,
+    pub upstream_scheme: String,
+    pub upstream_port: u16,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct UpdatePathRoute {
+    pub path_prefix: String,
+    pub upstream_scheme: String,
+    pub upstream_port: u16,
+}
+
 impl BindingManager {
     pub fn new(
         store: Store,
@@ -74,17 +88,7 @@ impl BindingManager {
 
     pub async fn create(&self, input: CreateBinding) -> Result<Binding> {
         let hostname = normalize_hostname(&input.hostname)?;
-        if !matches!(input.upstream_scheme.as_str(), "http" | "https") {
-            bail!("upstream scheme must be http or https");
-        }
-        if input.upstream_port == 0 || self.reserved_ports.contains(&input.upstream_port) {
-            bail!(
-                "port {} is one of HostKnot's own listeners (admin UI or proxy), so it cannot \
-                 be bound — the admin UI is always reached directly at https://<VPS-IP>:9443. \
-                 Bind the loopback port your application listens on instead.",
-                input.upstream_port
-            );
-        }
+        self.validate_local_upstream(&input.upstream_scheme, input.upstream_port)?;
         if self.public_ips.is_empty() {
             bail!("at least one public IP address is required");
         }
@@ -169,17 +173,7 @@ impl BindingManager {
     }
 
     pub async fn update(&self, id: &str, input: UpdateBinding) -> Result<()> {
-        if !matches!(input.upstream_scheme.as_str(), "http" | "https") {
-            bail!("upstream scheme must be http or https");
-        }
-        if input.upstream_port == 0 || self.reserved_ports.contains(&input.upstream_port) {
-            bail!(
-                "port {} is one of HostKnot's own listeners (admin UI or proxy), so it cannot \
-                 be bound — the admin UI is always reached directly at https://<VPS-IP>:9443. \
-                 Bind the loopback port your application listens on instead.",
-                input.upstream_port
-            );
-        }
+        self.validate_local_upstream(&input.upstream_scheme, input.upstream_port)?;
         let binding = self.store.binding(id)?.context("binding does not exist")?;
         if !binding.status.is_editable() {
             bail!("only active bindings can be edited");
@@ -210,6 +204,132 @@ impl BindingManager {
 
     pub fn port_is_bindable(&self, port: u16) -> bool {
         port != 0 && !self.reserved_ports.contains(&port)
+    }
+
+    pub fn create_path_route(
+        &self,
+        binding_id: &str,
+        input: CreatePathRoute,
+    ) -> Result<BindingPathRoute> {
+        self.validate_local_upstream(&input.upstream_scheme, input.upstream_port)?;
+        let path_prefix = normalize_path_prefix(&input.path_prefix)?;
+        let binding = self
+            .store
+            .binding(binding_id)?
+            .context("binding does not exist")?;
+        if !binding.status.is_editable() {
+            bail!("path routes can only be changed on active bindings");
+        }
+        if self
+            .store
+            .list_path_routes(binding_id)?
+            .iter()
+            .any(|route| route.path_prefix == path_prefix)
+        {
+            bail!("this path prefix already has a route");
+        }
+        let route = self.store.create_path_route(
+            &Uuid::now_v7().to_string(),
+            binding_id,
+            &path_prefix,
+            &input.upstream_scheme,
+            input.upstream_port,
+        )?;
+        self.record_event(&format!(
+            "Path route added: {}{} → {}://127.0.0.1:{}",
+            binding.hostname, route.path_prefix, route.upstream_scheme, route.upstream_port
+        ));
+        Ok(route)
+    }
+
+    pub fn update_path_route(
+        &self,
+        binding_id: &str,
+        route_id: &str,
+        input: UpdatePathRoute,
+    ) -> Result<()> {
+        self.validate_local_upstream(&input.upstream_scheme, input.upstream_port)?;
+        let path_prefix = normalize_path_prefix(&input.path_prefix)?;
+        let binding = self
+            .store
+            .binding(binding_id)?
+            .context("binding does not exist")?;
+        if !binding.status.is_editable() {
+            bail!("path routes can only be changed on active bindings");
+        }
+        let previous = self
+            .store
+            .path_route(route_id)?
+            .filter(|route| route.binding_id == binding_id)
+            .context("path route does not exist")?;
+        if self
+            .store
+            .list_path_routes(binding_id)?
+            .iter()
+            .any(|route| route.id != route_id && route.path_prefix == path_prefix)
+        {
+            bail!("this path prefix already has a route");
+        }
+        if !self.store.update_path_route(
+            route_id,
+            binding_id,
+            &path_prefix,
+            &input.upstream_scheme,
+            input.upstream_port,
+        )? {
+            bail!("path route does not exist");
+        }
+        self.record_event(&format!(
+            "Path route updated: {}{} → {}{} ({}://127.0.0.1:{})",
+            binding.hostname,
+            previous.path_prefix,
+            binding.hostname,
+            path_prefix,
+            input.upstream_scheme,
+            input.upstream_port
+        ));
+        Ok(())
+    }
+
+    pub fn delete_path_route(&self, binding_id: &str, route_id: &str) -> Result<()> {
+        let binding = self
+            .store
+            .binding(binding_id)?
+            .context("binding does not exist")?;
+        if !binding.status.is_editable() {
+            bail!("path routes can only be changed on active bindings");
+        }
+        let route = self
+            .store
+            .path_route(route_id)?
+            .filter(|route| route.binding_id == binding_id)
+            .context("path route does not exist")?;
+        if !self.store.delete_path_route(route_id, binding_id)? {
+            bail!("path route does not exist");
+        }
+        self.record_event(&format!(
+            "Path route removed: {}{} ({}://127.0.0.1:{})",
+            binding.hostname, route.path_prefix, route.upstream_scheme, route.upstream_port
+        ));
+        Ok(())
+    }
+
+    pub fn list_path_routes(&self, binding_id: &str) -> Result<Vec<BindingPathRoute>> {
+        self.store.list_path_routes(binding_id)
+    }
+
+    fn validate_local_upstream(&self, scheme: &str, port: u16) -> Result<()> {
+        if !matches!(scheme, "http" | "https") {
+            bail!("upstream scheme must be http or https");
+        }
+        if !self.port_is_bindable(port) {
+            bail!(
+                "port {port} is one of HostKnot's own listeners (admin UI or proxy), so it cannot \
+                 be bound — the admin UI is always reached directly at https://<VPS-IP>:9443. \
+                 Bind the loopback port your application listens on instead."
+            );
+        }
+        Ok(())
     }
 
     pub async fn reconcile_nudged(&self) {
@@ -391,6 +511,32 @@ pub fn normalize_hostname(hostname: &str) -> Result<String> {
         bail!("hostname must be a fully-qualified domain name");
     }
     Ok(ascii)
+}
+
+pub fn normalize_path_prefix(path_prefix: &str) -> Result<String> {
+    let path_prefix = path_prefix.trim().trim_end_matches('/');
+    if path_prefix.is_empty()
+        || path_prefix == "/"
+        || path_prefix.len() > 256
+        || !path_prefix.starts_with('/')
+        || path_prefix.contains(['?', '#', '%', '\\'])
+        || !path_prefix.is_ascii()
+    {
+        bail!("path prefix must be an absolute ASCII path below /");
+    }
+    if path_prefix
+        .split('/')
+        .skip(1)
+        .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        bail!("path prefix cannot contain empty, . or .. segments");
+    }
+    if !path_prefix.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~')
+    }) {
+        bail!("path prefix contains unsupported characters");
+    }
+    Ok(path_prefix.to_owned())
 }
 
 fn unix_now() -> i64 {

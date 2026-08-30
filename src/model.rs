@@ -124,6 +124,29 @@ pub(crate) struct Binding {
     pub(crate) replace_confirmed: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct BindingPathRoute {
+    pub(crate) id: String,
+    pub(crate) binding_id: String,
+    pub(crate) path_prefix: String,
+    pub(crate) upstream_scheme: String,
+    pub(crate) upstream_port: u16,
+    pub(crate) health: BindingHealth,
+    pub(crate) last_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProxyRoute {
+    pub(crate) binding_id: String,
+    pub(crate) path_route_id: Option<String>,
+    pub(crate) hostname: String,
+    pub(crate) upstream_scheme: String,
+    pub(crate) upstream_port: u16,
+    pub(crate) proxied: bool,
+    pub(crate) health: BindingHealth,
+    pub(crate) last_error: Option<String>,
+}
+
 impl Binding {
     pub(crate) fn is_routable(&self) -> bool {
         self.certificate_status == CertificateStatus::Active

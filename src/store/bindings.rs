@@ -1,9 +1,7 @@
-use std::time::Instant;
-
 use anyhow::{Context, Result};
 use rusqlite::{OptionalExtension, params};
 
-use super::{ROUTE_CACHE_TTL, Store};
+use super::Store;
 use crate::{
     model::{Binding, BindingHealth, BindingStatus, CertificateStatus, PendingBindingUpdate},
     provider::{DnsPlan, DnsReceipt},
@@ -67,14 +65,13 @@ impl Store {
     }
 
     pub fn active_binding(&self, hostname: &str) -> Result<Option<Binding>> {
-        let cache_key = hostname.to_ascii_lowercase();
-        if let Ok(cache) = self.route_cache.lock()
-            && let Some((cached_at, binding)) = cache.get(&cache_key)
-            && cached_at.elapsed() < ROUTE_CACHE_TTL
-        {
-            return Ok(binding.clone());
-        }
-        let binding = self
+        Ok(self
+            .active_routing_table(hostname)?
+            .map(|table| table.binding))
+    }
+
+    pub(super) fn binding_for_hostname(&self, hostname: &str) -> Result<Option<Binding>> {
+        Ok(self
             .connection()?
             .query_row(
                 "SELECT id, hostname, upstream_scheme, upstream_port, proxied,
@@ -84,11 +81,7 @@ impl Store {
                 binding_from_row,
             )
             .optional()?
-            .filter(Binding::is_routable);
-        if let Ok(mut cache) = self.route_cache.lock() {
-            cache.insert(cache_key, (Instant::now(), binding.clone()));
-        }
-        Ok(binding)
+            .filter(Binding::is_routable))
     }
 
     pub fn hostname_is_routable(&self, hostname: &str) -> Result<bool> {

@@ -39,9 +39,10 @@ Schema migrations are transactional and forward-only. Do not start an older Host
 - **Cloudflare rate limit or transient 5xx:** requests honor `Retry-After` and use bounded retries. Persisted pending work resumes later.
 - **Conflicting records:** HostKnot requires explicit replacement confirmation and stores the prior records in its permission-protected state database.
 - **DNS drift during edit/unbind:** the binding remains in a retryable update or removal state, and HostKnot leaves externally changed records untouched.
-- **Upstream unavailable:** clients receive a minimal 502 and the binding becomes degraded. A successful request returns it to active/healthy.
+- **Default upstream unavailable:** clients receive a minimal 502 and the binding becomes degraded. A successful request returns it to active/healthy.
+- **Path-route upstream unavailable:** matching clients receive a minimal 502 and only that route becomes unavailable. HostKnot never retries the request against the default upstream.
 - **Lost admin password:** run `hostknot admin reset`; existing routes remain online.
 
 ## Security notes
 
-Only bind upstreams on IPv4/IPv6 loopback. The proxy never accepts arbitrary target addresses and does not access the Docker socket. Keep port 9443 firewall-restricted where practical. Do not expose `/var/lib/hostknot/master.key`, the SQLite database, OAuth client secret, or setup/reset URLs.
+Only bind default and path-route upstreams on IPv4/IPv6 loopback. The proxy never accepts arbitrary target addresses and does not access the Docker socket. Keep port 9443 firewall-restricted where practical. Do not expose `/var/lib/hostknot/master.key`, the SQLite database, OAuth client secret, or setup/reset URLs.
