@@ -121,7 +121,27 @@ test("connect Cloudflare, bind, confirm replacement, and unbind", async ({ page 
       .filter({ hasText: "conflict.example.com" })
   ).toBeVisible();
 
+  // Add, edit, and remove a generic secondary path route.
+  await page.goto(fixture.baseUrl);
+  const appBindingId = await appRow.getAttribute("data-binding-id");
+  await appRow.getByRole("link", { name: "Edit" }).click();
+  const addRoute = page.locator(`form[action="/bindings/${appBindingId}/routes"]`);
+  await addRoute.getByLabel("Path prefix").fill("/assets/");
+  await addRoute.getByLabel("Local port").fill(String(fixture.upstreamPort));
+  await addRoute.getByRole("button", { name: "Add path route" }).click();
+  let pathRow = page.locator("tr[data-route-id]").filter({ hasText: "/assets" });
+  await expect(pathRow).toBeVisible();
+  await expect(pathRow).toContainText(`http://127.0.0.1:${fixture.upstreamPort}`);
+  await pathRow.getByRole("link", { name: "Edit" }).click();
+  await page.getByLabel("Path prefix").fill("/static/");
+  await page.getByRole("button", { name: "Save path route" }).click();
+  pathRow = page.locator("tr[data-route-id]").filter({ hasText: "/static" });
+  await expect(pathRow).toBeVisible();
+  await pathRow.getByRole("button", { name: "Remove" }).click();
+  await expect(page.locator("tr[data-route-id]")).toHaveCount(0);
+
   // Unbind becomes a read-only draining state, then disappears.
+  await page.goto(fixture.baseUrl);
   await appRow.getByRole("button", { name: "Unbind" }).click();
   await expect(appRow.locator(".pill.draining")).toBeVisible();
   await expect(appRow.getByRole("link", { name: "Edit" })).toHaveCount(0);

@@ -3,6 +3,8 @@ use axum::{
     response::{Html, IntoResponse, Response},
 };
 
+use crate::model::{Binding, BindingPathRoute};
+
 pub(super) trait HtmlStatus {
     fn into_response_with_status(self, status: StatusCode) -> Response;
 }
@@ -17,6 +19,73 @@ impl HtmlStatus for Html<String> {
 
 pub(super) fn page(title: &str, body: &str) -> String {
     page_with_head(title, "", body)
+}
+
+pub(super) fn binding_edit_page(
+    binding: &Binding,
+    routes: &[BindingPathRoute],
+    csrf: &str,
+) -> String {
+    let hostname = escape_html(&binding.hostname);
+    let binding_id = escape_html(&binding.id);
+    let csrf = escape_html(csrf);
+    let http_selected = (binding.upstream_scheme == "http")
+        .then_some(" selected")
+        .unwrap_or_default();
+    let https_selected = (binding.upstream_scheme == "https")
+        .then_some(" selected")
+        .unwrap_or_default();
+    let proxied = binding.proxied.then_some(" checked").unwrap_or_default();
+    let upstream_port = binding.upstream_port;
+    let path_routes = path_routes_section(&binding_id, routes, &csrf);
+
+    page(
+        "Edit binding",
+        &format!(
+            r#"<main><a href="/">← Bindings</a><span class="eyebrow block">EDIT ROUTE</span><h1>{hostname}</h1><p>Hostnames are immutable. Create a replacement binding to use a different hostname.</p><form method="post" action="/bindings/{binding_id}"><input type="hidden" name="csrf" value="{csrf}"><div class="managed-tls"><strong>Public HTTPS is automatic</strong><span>These settings only control the connection to the local service.</span></div><label>Local service protocol<select name="upstream_scheme"><option value="http"{http_selected}>HTTP</option><option value="https"{https_selected}>HTTPS</option></select><small class="form-help">Private and self-signed loopback certificates are accepted automatically.</small></label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" value="{upstream_port}" required></label><label class="check"><input name="proxied" type="checkbox" value="true"{proxied}> Enable Cloudflare proxy</label><button type="submit">Save changes</button></form>{path_routes}</main>"#
+        ),
+    )
+}
+
+fn path_routes_section(binding_id: &str, routes: &[BindingPathRoute], csrf: &str) -> String {
+    let route_table = if routes.is_empty() {
+        r#"<p class="muted">No path routes. All requests use the default upstream.</p>"#.to_owned()
+    } else {
+        let rows = routes
+            .iter()
+            .map(|route| path_route_row(binding_id, route, csrf))
+            .collect::<String>();
+        format!(
+            r#"<section class="table compact-table"><table><thead><tr><th>Path</th><th>Upstream</th><th>Health</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table></section>"#
+        )
+    };
+
+    format!(
+        r#"<section class="path-routes"><span class="eyebrow block">PATH ROUTES</span><h2>Secondary services</h2><p>The longest matching path uses its configured service. Other requests continue to use the default upstream.</p>{route_table}<form method="post" action="/bindings/{binding_id}/routes"><input type="hidden" name="csrf" value="{csrf}"><h3>Add path route</h3><label>Path prefix<input name="path_prefix" placeholder="/assets" required><small class="form-help">The complete request path is preserved. Trailing slashes are normalized.</small></label><label>Local service protocol<select name="upstream_scheme"><option value="http" selected>HTTP</option><option value="https">HTTPS</option></select></label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" required></label><button type="submit">Add path route</button></form></section>"#
+    )
+}
+
+fn path_route_row(binding_id: &str, route: &BindingPathRoute, csrf: &str) -> String {
+    let route_id = escape_html(&route.id);
+    let path_prefix = escape_html(&route.path_prefix);
+    let upstream_scheme = escape_html(&route.upstream_scheme);
+    let upstream_port = route.upstream_port;
+    let health = route.health.as_str();
+    let health_title = title_status(health);
+    let health_error = route
+        .last_error
+        .as_deref()
+        .map(|error| {
+            format!(
+                r#"<small class="health-error">{}</small>"#,
+                escape_html(error)
+            )
+        })
+        .unwrap_or_default();
+
+    format!(
+        r#"<tr data-route-id="{route_id}"><td data-label="Path"><code>{path_prefix}</code></td><td data-label="Upstream"><code class="upstream">{upstream_scheme}://127.0.0.1:{upstream_port}</code></td><td data-label="Health"><span class="pill {health}">{health_title}</span>{health_error}</td><td class="actions" data-label="Actions"><div class="row-actions"><a class="button secondary" href="/bindings/{binding_id}/routes/{route_id}/edit">Edit</a><form class="inline" method="post" action="/bindings/{binding_id}/routes/{route_id}/remove"><input type="hidden" name="csrf" value="{csrf}"><button class="danger" type="submit">Remove</button></form></div></td></tr>"#
+    )
 }
 
 /// Every failure the operator can hit renders as a styled page with a way
@@ -175,10 +244,14 @@ th{color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.
 .row-actions button,.row-actions .button{padding:10px 16px}
 .pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:3px 10px}
 .pill.active{border-color:#65d68b;color:var(--accent)}
+.pill.healthy{border-color:#65d68b;color:var(--accent)}
 .pill.degraded{border-color:#f2c94c88;color:#f2d98a}
+.pill.unavailable{border-color:#ffb4a988;color:#ffb4a9}
 .pill.removing,.pill.updating{border-color:#ffb4a988;color:#ffb4a9}
 .pill.draining,.pill.dns_pending,.pill.certificate_pending{color:var(--muted)}
 .check-help{margin:-12px 0 20px 30px}
+.path-routes{margin-top:3rem}
+.compact-table{margin-top:1rem}
 .error-detail{overflow-wrap:anywhere}
 .events ol{list-style:none;margin:0;padding:0}
 .events li{display:flex;align-items:baseline;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}

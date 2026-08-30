@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use rusqlite::Connection;
 
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 pub(super) fn migrate(connection: &Connection) -> Result<()> {
     let schema_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -144,6 +144,41 @@ pub(super) fn migrate(connection: &Connection) -> Result<()> {
               SELECT RAISE(ABORT, 'invalid certificate status');
             END;
             PRAGMA user_version = 3;
+            COMMIT;
+            ",
+        )?;
+    }
+    if schema_version < 4 {
+        connection.execute_batch(
+            "
+            BEGIN IMMEDIATE;
+            CREATE TABLE binding_path_routes (
+                id TEXT PRIMARY KEY,
+                binding_id TEXT NOT NULL REFERENCES bindings(id) ON DELETE CASCADE,
+                path_prefix TEXT NOT NULL,
+                upstream_scheme TEXT NOT NULL CHECK (upstream_scheme IN ('http', 'https')),
+                upstream_port INTEGER NOT NULL CHECK (upstream_port BETWEEN 1 AND 65535),
+                health TEXT NOT NULL DEFAULT 'unknown',
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(binding_id, path_prefix)
+            );
+            CREATE INDEX binding_path_routes_binding_prefix
+                ON binding_path_routes(binding_id, path_prefix);
+            CREATE TRIGGER binding_path_routes_health_insert_check
+            BEFORE INSERT ON binding_path_routes
+            WHEN NEW.health NOT IN ('unknown', 'healthy', 'unavailable')
+            BEGIN
+              SELECT RAISE(ABORT, 'invalid path route health');
+            END;
+            CREATE TRIGGER binding_path_routes_health_update_check
+            BEFORE UPDATE OF health ON binding_path_routes
+            WHEN NEW.health NOT IN ('unknown', 'healthy', 'unavailable')
+            BEGIN
+              SELECT RAISE(ABORT, 'invalid path route health');
+            END;
+            PRAGMA user_version = 4;
             COMMIT;
             ",
         )?;

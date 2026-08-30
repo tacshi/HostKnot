@@ -1,4 +1,5 @@
 mod bindings;
+mod path_routes;
 mod schema;
 
 use std::{
@@ -23,7 +24,7 @@ use subtle::ConstantTimeEq;
 
 use crate::clock::Clock;
 use crate::crypto::Vault;
-use crate::model::Binding;
+use crate::model::{Binding, BindingPathRoute};
 
 #[derive(Clone)]
 pub struct Store {
@@ -36,7 +37,13 @@ pub struct Store {
     route_cache: Arc<Mutex<RouteCache>>,
 }
 
-type RouteCache = HashMap<String, (Instant, Option<Binding>)>;
+#[derive(Clone)]
+struct RoutingTable {
+    binding: Binding,
+    path_routes: Vec<BindingPathRoute>,
+}
+
+type RouteCache = HashMap<String, (Instant, Option<RoutingTable>)>;
 
 const ROUTE_CACHE_TTL: Duration = Duration::from_secs(2);
 
@@ -766,6 +773,72 @@ mod tests {
                 .execute("UPDATE bindings SET status = 'typo' WHERE id = 'b1'", [])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn schema_v4_adds_persistent_unique_path_routes_with_cascading_deletion() {
+        let state = tempfile::TempDir::new().unwrap();
+        ensure_master_key(&state.path().join("master.key")).unwrap();
+        let connection = Connection::open(state.path().join("hostknot.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE bindings (
+                    id TEXT PRIMARY KEY,
+                    hostname TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    upstream_scheme TEXT NOT NULL,
+                    upstream_port INTEGER NOT NULL,
+                    proxied INTEGER NOT NULL DEFAULT 1,
+                    provider TEXT NOT NULL DEFAULT 'cloudflare',
+                    zone_id TEXT,
+                    dns_receipt TEXT,
+                    status TEXT NOT NULL,
+                    certificate_status TEXT NOT NULL,
+                    health TEXT NOT NULL,
+                    last_error TEXT,
+                    drain_until INTEGER,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    replace_confirmed INTEGER NOT NULL DEFAULT 0,
+                    dns_plan TEXT,
+                    pending_update TEXT
+                );
+                INSERT INTO bindings(
+                    id, hostname, upstream_scheme, upstream_port, status,
+                    certificate_status, health, created_at, updated_at
+                ) VALUES(
+                    'b1', 'app.example.com', 'http', 3000, 'active',
+                    'active', 'unknown', 1, 1
+                );
+                PRAGMA user_version = 3;
+                ",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(state.path()).unwrap();
+        assert_eq!(
+            store
+                .connection()
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        store
+            .create_path_route("r1", "b1", "/assets", "http", 8080)
+            .unwrap();
+        assert!(
+            store
+                .create_path_route("r2", "b1", "/assets", "http", 8081)
+                .is_err()
+        );
+        drop(store);
+
+        let reopened = Store::open(state.path()).unwrap();
+        assert_eq!(reopened.list_path_routes("b1").unwrap().len(), 1);
+        reopened.delete_binding("b1").unwrap();
+        assert!(reopened.path_route("r1").unwrap().is_none());
     }
 
     #[test]

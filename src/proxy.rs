@@ -136,7 +136,13 @@ async fn proxy_entry(
     let Some(hostname) = request_hostname(&request) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let Some(binding) = state.store.active_binding(&hostname).ok().flatten() else {
+    let request_path = request.uri().path().to_owned();
+    let Some(route) = state
+        .store
+        .active_proxy_route(&hostname, &request_path)
+        .ok()
+        .flatten()
+    else {
         return StatusCode::NOT_FOUND.into_response();
     };
     // h2 requests carry no Host header; materialize one from :authority so the
@@ -153,7 +159,7 @@ async fn proxy_entry(
     // the real visitor is in CF-Connecting-IP. Trust that header ONLY when
     // the peer verifiably belongs to Cloudflare's published ranges; from any
     // other peer the header is an untrusted spoof and must not reach the app.
-    let trusted_cloudflare_hop = binding.proxied && is_cloudflare_ip(peer.ip());
+    let trusted_cloudflare_hop = route.proxied && is_cloudflare_ip(peer.ip());
     if !trusted_cloudflare_hop {
         request.headers_mut().remove("cf-connecting-ip");
         request.headers_mut().remove("true-client-ip");
@@ -173,7 +179,7 @@ async fn proxy_entry(
         .unwrap_or("/");
     let upstream_uri: Uri = match format!(
         "{}://{}:{}{}",
-        binding.upstream_scheme, hostname, binding.upstream_port, path
+        route.upstream_scheme, route.hostname, route.upstream_port, path
     )
     .parse()
     {
@@ -186,7 +192,7 @@ async fn proxy_entry(
     // HTTPS upstreams are pinned to loopback by the connector. HostKnot owns
     // the public certificate, so a private/self-signed certificate on this
     // local-only hop must not require operator configuration.
-    let client = if binding.upstream_scheme == "https" {
+    let client = if route.upstream_scheme == "https" {
         &state.insecure_client
     } else {
         &state.client
@@ -195,10 +201,17 @@ async fn proxy_entry(
         Ok(mut response) => {
             // Persist health only on transitions — a WAL commit per proxied
             // request would serialize all traffic on the store mutex.
-            if binding.health != BindingHealth::Healthy
-                && let Err(error) = state.store.update_binding_health(&binding.id, true, None)
-            {
-                tracing::debug!(%error, "failed to persist upstream health");
+            if route.health != BindingHealth::Healthy {
+                let result = if let Some(route_id) = route.path_route_id.as_deref() {
+                    state.store.update_path_route_health(route_id, true, None)
+                } else {
+                    state
+                        .store
+                        .update_binding_health(&route.binding_id, true, None)
+                };
+                if let Err(error) = result {
+                    tracing::debug!(%error, "failed to persist upstream health");
+                }
             }
             if websocket && response.status() == StatusCode::SWITCHING_PROTOCOLS {
                 let upstream_upgrade = hyper::upgrade::on(&mut response);
@@ -227,20 +240,27 @@ async fn proxy_entry(
         }
         Err(error) => {
             tracing::warn!(hostname, %error, "upstream request failed");
-            let health_error = if binding.upstream_scheme == "https" {
+            let health_error = if route.upstream_scheme == "https" {
                 "HTTPS upstream failed. Verify the local service actually uses HTTPS on this \
                  port; HostKnot already accepts its private/self-signed certificate."
             } else {
                 "HTTP upstream failed. Verify the local service is running on this port."
             };
-            if (binding.health != BindingHealth::Unavailable
-                || binding.last_error.as_deref() != Some(health_error))
-                && let Err(store_error) =
+            if route.health != BindingHealth::Unavailable
+                || route.last_error.as_deref() != Some(health_error)
+            {
+                let result = if let Some(route_id) = route.path_route_id.as_deref() {
                     state
                         .store
-                        .update_binding_health(&binding.id, false, Some(health_error))
-            {
-                tracing::debug!(%store_error, "failed to persist upstream failure");
+                        .update_path_route_health(route_id, false, Some(health_error))
+                } else {
+                    state
+                        .store
+                        .update_binding_health(&route.binding_id, false, Some(health_error))
+                };
+                if let Err(store_error) = result {
+                    tracing::debug!(%store_error, "failed to persist upstream failure");
+                }
             }
             (StatusCode::BAD_GATEWAY, "Upstream unavailable").into_response()
         }
