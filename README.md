@@ -80,7 +80,7 @@ The installer prints these next steps along with the everyday commands. Run `hos
 hostknot admin url
 ```
 
-Before first setup it prints a one-time link like `https://<YOUR_VPS_IP>:9443/setup?token=...`, valid for one hour; run it again any time for a fresh one (earlier links stop working). Once an administrator exists, it prints the sign-in URL instead. The service log also prints a setup link at startup. Before the admin UI is served, HostKnot obtains a trusted Let's Encrypt IP certificate over HTTP-01, so port 80 must already be reachable; if issuance fails, the UI still comes up on a self-signed fallback and keeps retrying.
+Before first setup it prints a one-time link like `https://<YOUR_VPS_IP>:9443/setup?token=...`, valid for one hour; run it again any time for a fresh one (earlier links stop working). Once an administrator exists, it prints the sign-in URL instead. The setup token itself is never written to the service log, which non-root users in the `adm` or `systemd-journal` groups can often read. Before the admin UI is served, HostKnot obtains a trusted Let's Encrypt IP certificate over HTTP-01, so port 80 must already be reachable; if issuance fails, the UI still comes up on a self-signed fallback and keeps retrying.
 
 **3. Create the administrator.** Open the URL, set an admin password (12+ characters) and an ACME contact email.
 
@@ -98,7 +98,7 @@ Before first setup it prints a one-time link like `https://<YOUR_VPS_IP>:9443/se
 ## What to expect from bindings
 
 - **Exact hostnames only.** `app.example.com` matches `app.example.com` — no wildcard hosts. Hostnames are immutable; to rename, create a replacement binding.
-- **Optional longest-prefix routes.** `/assets` matches `/assets` and `/assets/...`, but not `/assets-old`. Overlapping routes are allowed and the most specific match wins. Prefixes are preserved rather than stripped or rewritten.
+- **Optional longest-prefix routes.** `/assets` matches `/assets` and `/assets/...`, but not `/assets-old`. Overlapping routes are allowed and the most specific match wins. Prefixes are preserved rather than stripped. Dot segments (including `%2e`) are resolved before matching, and the resolved path is what the upstream receives, so `/api/../admin` reaches the service for `/admin`, never the `/api` service.
 - **Editable after creation:** the default local port and protocol, Cloudflare proxied/DNS-only mode, and secondary path routes.
 - **Failures stay isolated.** If a matched path route is unavailable, HostKnot returns an opaque 502 and does not retry against the default upstream. Each path route reports health independently.
 - **Certificate hiccups don't dead-end.** If issuance is delayed (DNS propagation, a busy CA), the binding shows *Certificate pending* on the dashboard and retries in the background with backoff — no action needed.
@@ -143,7 +143,7 @@ The installer writes `/etc/hostknot/config.toml` **on first install only** — r
 Run the new binary's installer against the live service, then restart and confirm the version actually changed:
 
 ```sh
-sudo ./hostknot service install --public-ip <YOUR_VPS_IP> --binary ./hostknot && sudo systemctl restart hostknot && hostknot version
+sudo ./hostknot service install --public-ip <YOUR_VPS_IP> --binary ./hostknot && sudo systemctl daemon-reload && sudo systemctl restart hostknot && hostknot version
 ```
 
 Bindings, credentials, and certificates are preserved — upgrades only swap the binary (staged and renamed atomically, so a running service is safe to upgrade in place).
@@ -159,10 +159,11 @@ Reinstalls never touch an existing config, so a changed VPS address is a manual 
 
 ## Security model
 
-- **Least privilege.** The systemd unit runs under a private dynamic user with `CAP_NET_BIND_SERVICE` as its only capability, a read-only host filesystem, and a writable state directory.
+- **Least privilege.** The systemd unit runs under a private dynamic user with `CAP_NET_BIND_SERVICE` as its only capability, a read-only host filesystem, a writable state directory, a system-call allow-list, no namespace creation, and a `0077` umask.
 - **Encrypted at rest.** OAuth secrets and tokens, ACME account credentials, and certificate keys are sealed with XChaCha20-Poly1305 under a mode-`0600` master key (context-bound so ciphertexts can't be swapped between columns). The service refuses to start if the key is readable by other users. Only Argon2id hashes are stored for the admin password.
-- **Hardened admin surface.** HTTPS with a trusted IP certificate, HTTP-only same-site session cookies, per-session CSRF tokens with origin checks, per-IP login throttling, expiring single-use setup/reset tokens, OAuth state bound to the initiating session (PKCE S256), and strict security headers.
-- **Contained proxying.** Default and path-route upstreams are pinned to loopback — the proxy cannot be pointed at arbitrary hosts. Inbound `X-Forwarded-*` headers are overwritten, hop-by-hop headers are stripped, and upstream failures return an opaque 502. For HTTPS upstreams, private and self-signed certificates are accepted automatically: that hop never leaves the machine, while the public-facing side always serves real, verified certificates. `CF-Connecting-IP` is honored only from verified Cloudflare edge addresses and stripped from everything else.
+- **Hardened admin surface.** HTTPS with a trusted IP certificate, `__Host-` HTTP-only same-site session cookies, per-session CSRF tokens with origin checks (including the link that starts Cloudflare authorization), per-address login throttling (IPv6 by /64) with password hashing kept off the request workers, expiring single-use setup/reset tokens that are never logged, OAuth state bound to the initiating session (PKCE S256), and strict security headers. Connecting a Cloudflare account that cannot reach existing bindings' zones is refused.
+- **Bounded public listeners.** Every listener caps connections per client address (IPv6 by /64; Cloudflare edges exempt on the proxy) and in total, limits TLS handshakes and request headers to 10s and 30s, closes idle keep-alive connections, pings idle HTTP/2 peers, and keeps the routing cache bounded however many hostnames clients invent.
+- **Contained proxying.** Default and path-route upstreams are pinned to loopback — the proxy cannot be pointed at arbitrary hosts. Inbound `X-Forwarded-*` headers are overwritten, hop-by-hop headers are stripped, and upstream failures return an opaque 502. For HTTPS upstreams, private and self-signed certificates are accepted automatically: that hop never leaves the machine, while the public-facing side always serves real, verified certificates. `CF-Connecting-IP` is honored only from verified Cloudflare edge addresses and stripped from everything else. Upstreams receive exactly one `Host` header (the routed hostname), and non-path request targets such as `OPTIONS *` are refused.
 
 ## Troubleshooting
 

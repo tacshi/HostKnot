@@ -131,14 +131,15 @@ async fn main() -> Result<()> {
         Command::Version => println!("hostknot {}", env!("CARGO_PKG_VERSION")),
         Command::Serve(args) => {
             let config = FileConfig::load(&args.config)?.runtime();
-            let public_url = config.admin_public_url.clone();
             let running = HostKnot::start(config).await?;
-            if let Some(token) = running.bootstrap_token() {
-                let setup_url = hostknot::setup_url(
-                    &public_url.context("admin public URL is required")?,
-                    &token,
-                )?;
-                eprintln!("Open this one-time setup URL: {setup_url}");
+            // The journal is readable beyond root (adm/systemd-journal), so
+            // the setup token itself is never logged; root fetches a link
+            // on demand instead.
+            if running.bootstrap_token().is_some() {
+                eprintln!(
+                    "No administrator yet. On this server, run `sudo hostknot admin url` \
+                     for a one-time setup link."
+                );
             }
             wait_for_shutdown_signal().await?;
             running.shutdown().await;
@@ -261,8 +262,10 @@ fn print_install_guide(config_path: &Path, upgrade: bool) {
         println!();
         section("Next step");
         step(
-            "Restart onto the new binary and confirm the version",
-            Some("sudo systemctl restart hostknot && hostknot version"),
+            "Load the updated unit, restart onto the new binary, and confirm the version",
+            Some(
+                "sudo systemctl daemon-reload && sudo systemctl restart hostknot && hostknot version",
+            ),
         );
     } else {
         println!("HostKnot installed.");

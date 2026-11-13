@@ -2,6 +2,8 @@ mod bindings;
 mod path_routes;
 mod schema;
 
+pub(crate) use path_routes::routing_path;
+
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
@@ -80,6 +82,7 @@ pub struct Event {
 }
 
 impl Store {
+    #[cfg(test)]
     pub fn open(state_dir: &Path) -> Result<Self> {
         Self::open_with_clock(state_dir, Clock::system())
     }
@@ -89,11 +92,68 @@ impl Store {
             .with_context(|| format!("create state directory {}", state_dir.display()))?;
         set_dir_permissions(state_dir)?;
         let master_key = ensure_master_key(&state_dir.join("master.key"))?;
+        Self::open_database(state_dir, master_key, clock, true)
+    }
 
+    /// Opens state the service already created, for local CLI commands. It
+    /// never creates anything: a root-created state directory or master key
+    /// would be unreadable by the DynamicUser service, and a fresh key next
+    /// to an existing database would orphan every sealed secret.
+    pub fn open_existing(state_dir: &Path) -> Result<Self> {
+        let database = state_dir.join("hostknot.sqlite3");
+        match fs::metadata(&database) {
+            Ok(_) => {}
+            // Under systemd's DynamicUser the state directory is a symlink
+            // into root-only /var/lib/private, so a non-root caller sees
+            // EACCES here.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => bail!(
+                "permission denied reading {}: HostKnot's state is private to root and \
+                 the service. Run this command with sudo.",
+                state_dir.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+                "no HostKnot state in {} yet. Start the service first \
+                 (sudo systemctl enable --now hostknot), then run this again.",
+                state_dir.display()
+            ),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", database.display()));
+            }
+        }
+        let key_path = state_dir.join("master.key");
+        if !key_path.exists() {
+            bail!(
+                "{} is missing; HostKnot cannot decrypt its state without it. \
+                 Restore it from the backup taken with the database.",
+                key_path.display()
+            );
+        }
+        let master_key = ensure_master_key(&key_path)?;
+        Self::open_database(state_dir, master_key, Clock::system(), false)
+    }
+
+    /// `migrate` is false for local CLI commands: the service upgrades its
+    /// own schema on restart, so a CLI run right after installing a new
+    /// binary must not migrate the database under the old, still-running
+    /// service.
+    fn open_database(
+        state_dir: &Path,
+        master_key: [u8; 32],
+        clock: Clock,
+        migrate: bool,
+    ) -> Result<Self> {
         let connection = Connection::open(state_dir.join("hostknot.sqlite3"))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        schema::migrate(&connection)?;
+        if migrate {
+            schema::migrate(&connection)?;
+        } else if schema::schema_version(&connection)? != schema::CURRENT_SCHEMA_VERSION {
+            bail!(
+                "the running HostKnot service uses a different version than this binary. \
+                 Restart it first (sudo systemctl restart hostknot) so it upgrades its own \
+                 state, then run this again."
+            );
+        }
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             vault: Vault::new(master_key),
@@ -458,6 +518,67 @@ impl Store {
         Ok(())
     }
 
+    /// Stores refreshed tokens only if the connection is still the one the
+    /// refresh started from; a disconnect or reconnect while the refresh was
+    /// in flight wins. Returns whether the tokens were stored.
+    pub fn replace_refreshed_cloudflare_tokens(
+        &self,
+        previous_refresh_token: &str,
+        access_token: &str,
+        refresh_token: &str,
+        expires_in: i64,
+        scopes: &str,
+    ) -> Result<bool> {
+        let mut connection = self.connection()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let stored: Option<Option<String>> = transaction
+            .query_row(
+                "SELECT refresh_token FROM provider_configuration WHERE provider = 'cloudflare'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let unchanged = match stored.flatten() {
+            Some(sealed) => {
+                self.vault.open("cloudflare.refresh_token", &sealed)? == previous_refresh_token
+            }
+            None => false,
+        };
+        if !unchanged {
+            return Ok(false);
+        }
+        transaction.execute(
+            "UPDATE provider_configuration SET
+               access_token = ?1, refresh_token = ?2, token_expires_at = ?3,
+               scopes = ?4, updated_at = ?5
+             WHERE provider = 'cloudflare'",
+            params![
+                self.vault.seal("cloudflare.access_token", access_token)?,
+                self.vault.seal("cloudflare.refresh_token", refresh_token)?,
+                self.now() + expires_in,
+                scopes,
+                self.now()
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Cloudflare zones that bindings still depend on: any not yet fully
+    /// removed, including a create whose plan is saved but not yet applied.
+    pub fn provider_zone_ids(&self) -> Result<Vec<String>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT COALESCE(zone_id, json_extract(dns_plan, '$.zone_id')) AS zone
+             FROM bindings WHERE status != 'draining' AND zone IS NOT NULL",
+        )?;
+        let zones = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(zones)
+    }
+
     pub fn cloudflare_tokens(&self) -> Result<Option<CloudflareTokens>> {
         let row: Option<(String, Option<String>, i64, String)> = self
             .connection()?
@@ -544,20 +665,37 @@ impl Store {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        encrypted
+        // One unreadable row must not take every other certificate (and the
+        // whole service) down with it; it is skipped and gets reissued.
+        Ok(encrypted
             .into_iter()
-            .map(
+            .filter_map(
                 |(identifier, certificate_pem, private_key_pem, not_after, renew_at)| {
-                    Ok(StoredCertificate {
-                        identifier,
-                        certificate_pem: self.vault.open("certificate.pem", &certificate_pem)?,
-                        private_key_pem: self.vault.open("certificate.key", &private_key_pem)?,
-                        not_after,
-                        renew_at,
-                    })
+                    let opened = self
+                        .vault
+                        .open("certificate.pem", &certificate_pem)
+                        .and_then(|certificate_pem| {
+                            Ok((
+                                certificate_pem,
+                                self.vault.open("certificate.key", &private_key_pem)?,
+                            ))
+                        });
+                    match opened {
+                        Ok((certificate_pem, private_key_pem)) => Some(StoredCertificate {
+                            identifier,
+                            certificate_pem,
+                            private_key_pem,
+                            not_after,
+                            renew_at,
+                        }),
+                        Err(error) => {
+                            tracing::error!(%error, identifier, "skipping unreadable stored certificate");
+                            None
+                        }
+                    }
                 },
             )
-            .collect()
+            .collect())
     }
 
     pub fn update_certificate_renew_at(&self, identifier: &str, renew_at: i64) -> Result<()> {
@@ -837,8 +975,151 @@ mod tests {
 
         let reopened = Store::open(state.path()).unwrap();
         assert_eq!(reopened.list_path_routes("b1").unwrap().len(), 1);
-        reopened.delete_binding("b1").unwrap();
+        reopened.set_binding_status_for_test("b1", BindingStatus::Draining);
+        assert!(reopened.delete_drained_binding("b1").unwrap());
         assert!(reopened.path_route("r1").unwrap().is_none());
+    }
+
+    #[test]
+    fn damaged_certificates_are_skipped_instead_of_blocking_startup() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let state = tempfile::TempDir::new().unwrap();
+        let store = Store::open(state.path()).unwrap();
+        // One row that decrypts but is not a certificate, one that no longer
+        // decrypts at all.
+        store
+            .save_certificate("garbage.example.com", "not a pem", "not a key", 0, 0)
+            .unwrap();
+        store
+            .save_certificate("tampered.example.com", "x", "y", 0, 0)
+            .unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE certificates SET certificate_pem = 'v1:corrupted'
+                 WHERE identifier = 'tampered.example.com'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.certificates().unwrap().len(), 1);
+        crate::certificates::CertificateResolver::new(
+            store.clone(),
+            crate::certificates::CertificateMode::Local,
+        )
+        .expect("startup survives damaged certificate rows");
+    }
+
+    #[test]
+    fn concurrent_migrations_of_a_fresh_database_all_succeed() {
+        for _ in 0..5 {
+            let state = tempfile::TempDir::new().unwrap();
+            let database = state.path().join("hostknot.sqlite3");
+            let barrier = Arc::new(std::sync::Barrier::new(4));
+            let migrations = (0..4)
+                .map(|_| {
+                    let database = database.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let connection = Connection::open(&database).unwrap();
+                        barrier.wait();
+                        schema::migrate(&connection)
+                    })
+                })
+                .collect::<Vec<_>>();
+            for migration in migrations {
+                migration.join().unwrap().unwrap();
+            }
+            let connection = Connection::open(&database).unwrap();
+            assert_eq!(
+                schema::schema_version(&connection).unwrap(),
+                schema::CURRENT_SCHEMA_VERSION
+            );
+        }
+    }
+
+    #[test]
+    fn local_commands_refuse_to_migrate_under_a_running_service() {
+        let state = tempfile::TempDir::new().unwrap();
+        drop(Store::open(state.path()).unwrap());
+        // Simulate a database still on the previous schema: the service has
+        // not restarted onto the newly installed binary yet.
+        Connection::open(state.path().join("hostknot.sqlite3"))
+            .unwrap()
+            .pragma_update(None, "user_version", schema::CURRENT_SCHEMA_VERSION - 1)
+            .unwrap();
+        let error = Store::open_existing(state.path())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("Restart it first"), "{error}");
+        let connection = Connection::open(state.path().join("hostknot.sqlite3")).unwrap();
+        assert_eq!(
+            schema::schema_version(&connection).unwrap(),
+            schema::CURRENT_SCHEMA_VERSION - 1
+        );
+    }
+
+    #[test]
+    fn a_refresh_that_lost_a_race_with_reconnect_is_discarded() {
+        let state = tempfile::TempDir::new().unwrap();
+        let store = Store::open(state.path()).unwrap();
+        store
+            .configure_cloudflare("client", "secret", "zone.read dns.write offline_access")
+            .unwrap();
+        store
+            .save_cloudflare_tokens("old-access", Some("old-refresh"), 0, "zone.read")
+            .unwrap();
+        // While a refresh with "old-refresh" is in flight, the operator
+        // reconnects and new tokens are stored.
+        store
+            .save_cloudflare_tokens("new-access", Some("new-refresh"), 3600, "zone.read")
+            .unwrap();
+        assert!(
+            !store
+                .replace_refreshed_cloudflare_tokens(
+                    "old-refresh",
+                    "refreshed-access",
+                    "refreshed-refresh",
+                    3600,
+                    "zone.read"
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.cloudflare_tokens().unwrap().unwrap().access_token,
+            "new-access"
+        );
+        // A refresh of the current connection is stored.
+        assert!(
+            store
+                .replace_refreshed_cloudflare_tokens(
+                    "new-refresh",
+                    "refreshed-access",
+                    "refreshed-refresh",
+                    3600,
+                    "zone.read"
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.cloudflare_tokens().unwrap().unwrap().access_token,
+            "refreshed-access"
+        );
+        // After a disconnect, a late refresh does not resurrect the tokens.
+        store.disconnect_cloudflare().unwrap();
+        assert!(
+            !store
+                .replace_refreshed_cloudflare_tokens(
+                    "refreshed-refresh",
+                    "zombie",
+                    "zombie",
+                    3600,
+                    "zone.read"
+                )
+                .unwrap()
+        );
+        assert!(store.cloudflare_tokens().unwrap().is_none());
     }
 
     #[test]
@@ -848,7 +1129,7 @@ mod tests {
         store
             .create_binding("b1", "app.example.com", "http", 8080, false, false)
             .unwrap();
-        store.mark_binding_active("b1").unwrap();
+        store.set_binding_status_for_test("b1", BindingStatus::Active);
         store.begin_binding_removal("b1").unwrap();
         store
             .mark_binding_error("b1", BindingStatus::Removing, "DNS drift")

@@ -1,17 +1,13 @@
 use anyhow::{Result, bail};
 use rusqlite::Connection;
 
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 4;
 
-pub(super) fn migrate(connection: &Connection) -> Result<()> {
-    let schema_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if schema_version > CURRENT_SCHEMA_VERSION {
-        bail!("state database schema {schema_version} is newer than this HostKnot binary");
-    }
-    if schema_version < 1 {
-        connection.execute_batch(
-            "
-            BEGIN IMMEDIATE;
+/// Ordered migrations: (version reached, statements).
+const MIGRATIONS: [(i64, &str); 4] = [
+    (
+        1,
+        "
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -79,25 +75,19 @@ pub(super) fn migrate(connection: &Connection) -> Result<()> {
                 updated_at INTEGER NOT NULL
             );
             PRAGMA user_version = 1;
-            COMMIT;
             ",
-        )?;
-    }
-    if schema_version < 2 {
-        connection.execute_batch(
-            "
-            BEGIN IMMEDIATE;
+    ),
+    (
+        2,
+        "
             ALTER TABLE oauth_attempts ADD COLUMN session_hash BLOB;
             ALTER TABLE bindings ADD COLUMN replace_confirmed INTEGER NOT NULL DEFAULT 0;
             PRAGMA user_version = 2;
-            COMMIT;
             ",
-        )?;
-    }
-    if schema_version < 3 {
-        connection.execute_batch(
-            "
-            BEGIN IMMEDIATE;
+    ),
+    (
+        3,
+        "
             ALTER TABLE bindings ADD COLUMN dns_plan TEXT;
             ALTER TABLE bindings ADD COLUMN pending_update TEXT;
             UPDATE bindings SET status = 'removing' WHERE status = 'drifted';
@@ -144,14 +134,11 @@ pub(super) fn migrate(connection: &Connection) -> Result<()> {
               SELECT RAISE(ABORT, 'invalid certificate status');
             END;
             PRAGMA user_version = 3;
-            COMMIT;
             ",
-        )?;
-    }
-    if schema_version < 4 {
-        connection.execute_batch(
-            "
-            BEGIN IMMEDIATE;
+    ),
+    (
+        4,
+        "
             CREATE TABLE binding_path_routes (
                 id TEXT PRIMARY KEY,
                 binding_id TEXT NOT NULL REFERENCES bindings(id) ON DELETE CASCADE,
@@ -179,9 +166,39 @@ pub(super) fn migrate(connection: &Connection) -> Result<()> {
               SELECT RAISE(ABORT, 'invalid path route health');
             END;
             PRAGMA user_version = 4;
-            COMMIT;
             ",
-        )?;
+    ),
+];
+
+pub(super) fn schema_version(connection: &Connection) -> Result<i64> {
+    Ok(connection.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
+pub(super) fn migrate(connection: &Connection) -> Result<()> {
+    let schema_version = self::schema_version(connection)?;
+    if schema_version > CURRENT_SCHEMA_VERSION {
+        bail!("state database schema {schema_version} is newer than this HostKnot binary");
+    }
+    for (target, statements) in MIGRATIONS {
+        if self::schema_version(connection)? >= target {
+            continue;
+        }
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        // Re-check under the write lock: another process (the service, or a
+        // root-run CLI command) may have applied this step meanwhile.
+        let step = self::schema_version(connection).and_then(|current| {
+            if current < target {
+                connection.execute_batch(statements)?;
+            }
+            Ok(())
+        });
+        match step {
+            Ok(()) => connection.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
     }
     Ok(())
 }

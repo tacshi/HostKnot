@@ -486,7 +486,7 @@ async fn initialize_and_connect(client: &Client, base: &str, bootstrap: String) 
         .await
         .unwrap();
     let connect = client
-        .get(format!("{base}/providers/cloudflare/connect"))
+        .get(format!("{base}/providers/cloudflare/connect?csrf={csrf}"))
         .send()
         .await
         .unwrap();

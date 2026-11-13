@@ -50,7 +50,7 @@ try {
   await page.getByLabel("Client ID").fill("hostknot-private-client");
   await page.getByLabel("Client secret").fill("fixture-secret");
   await page.getByRole("button", { name: "Save OAuth client" }).click();
-  await page.goto(`${fixture.baseUrl}/providers/cloudflare/connect`);
+  await page.getByRole("link", { name: "Authorize with Cloudflare" }).click();
   await page.getByText("Connected", { exact: true }).waitFor();
 
   const bindings = [

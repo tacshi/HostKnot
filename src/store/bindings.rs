@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{OptionalExtension, params};
 
 use super::Store;
@@ -91,17 +91,23 @@ impl Store {
     /// Persist the provider's complete pre-image before the first remote DNS
     /// write. Reconciliation can safely replay this plan after any crash.
     pub fn save_binding_dns_plan(&self, id: &str, plan: &DnsPlan) -> Result<()> {
-        self.connection()?.execute(
-            "UPDATE bindings SET dns_plan = ?1, status = ?2, last_error = NULL,
-               updated_at = ?3 WHERE id = ?4",
-            params![
-                serde_json::to_string(plan)?,
-                BindingStatus::DnsPending.as_str(),
-                self.now(),
-                id,
-            ],
-        )?;
+        self.transition(
+            "UPDATE bindings SET dns_plan = ?1, last_error = NULL,
+               updated_at = ?2 WHERE id = ?3 AND status = 'dns_pending'",
+            params![serde_json::to_string(plan)?, self.now(), id],
+        )
+    }
+
+    /// Applies one lifecycle step, but only from the state the caller
+    /// expects (encoded in the statement's WHERE clause). Steps are already
+    /// serialized per binding; this makes a lost race fail loudly instead of
+    /// silently overwriting a newer state.
+    fn transition(&self, sql: &str, params: impl rusqlite::Params) -> Result<()> {
+        let changed = self.connection()?.execute(sql, params)?;
         self.invalidate_routes();
+        if changed == 0 {
+            bail!("the binding changed state while this step ran; nothing was applied");
+        }
         Ok(())
     }
 
@@ -119,10 +125,10 @@ impl Store {
     }
 
     pub fn mark_binding_certificate_pending(&self, id: &str, receipt: &DnsReceipt) -> Result<()> {
-        self.connection()?.execute(
+        self.transition(
             "UPDATE bindings SET zone_id = ?1, dns_receipt = ?2,
                dns_plan = NULL, status = ?3, certificate_status = ?4,
-               last_error = NULL, updated_at = ?5 WHERE id = ?6",
+               last_error = NULL, updated_at = ?5 WHERE id = ?6 AND status = 'dns_pending'",
             params![
                 receipt.zone_id,
                 serde_json::to_string(receipt)?,
@@ -131,16 +137,14 @@ impl Store {
                 self.now(),
                 id
             ],
-        )?;
-        self.invalidate_routes();
-        Ok(())
+        )
     }
 
     pub fn mark_binding_active(&self, id: &str) -> Result<()> {
-        self.connection()?.execute(
+        self.transition(
             "UPDATE bindings SET status = ?1, certificate_status = ?2,
                health = ?3, last_error = NULL, pending_update = NULL,
-               updated_at = ?4 WHERE id = ?5",
+               updated_at = ?4 WHERE id = ?5 AND status = 'certificate_pending'",
             params![
                 BindingStatus::Active.as_str(),
                 CertificateStatus::Active.as_str(),
@@ -148,24 +152,25 @@ impl Store {
                 self.now(),
                 id,
             ],
-        )?;
-        self.invalidate_routes();
-        Ok(())
+        )
     }
 
+    /// Records why a step in `status` failed. It never changes the status:
+    /// if the binding has already moved on, the stale error is dropped.
     pub fn mark_binding_error(&self, id: &str, status: BindingStatus, error: &str) -> Result<()> {
         self.connection()?.execute(
-            "UPDATE bindings SET status = ?1, last_error = ?2, updated_at = ?3 WHERE id = ?4",
-            params![status.as_str(), error, self.now(), id],
+            "UPDATE bindings SET last_error = ?1, updated_at = ?2 WHERE id = ?3 AND status = ?4",
+            params![error, self.now(), id, status.as_str()],
         )?;
         self.invalidate_routes();
         Ok(())
     }
 
     pub fn update_binding_local(&self, id: &str, update: &PendingBindingUpdate) -> Result<()> {
-        self.connection()?.execute(
+        self.transition(
             "UPDATE bindings SET upstream_scheme = ?1, upstream_port = ?2,
-               proxied = ?3, last_error = NULL, updated_at = ?4 WHERE id = ?5",
+               proxied = ?3, last_error = NULL, updated_at = ?4
+             WHERE id = ?5 AND status IN ('active', 'degraded')",
             params![
                 update.upstream_scheme,
                 update.upstream_port,
@@ -173,27 +178,24 @@ impl Store {
                 self.now(),
                 id,
             ],
-        )?;
-        self.invalidate_routes();
-        Ok(())
+        )
     }
 
     /// Move an externally-visible edit into a durable intermediate state
     /// before changing the provider. The requested local values remain in the
     /// journal until the provider mutation and SQLite commit both finish.
     pub fn begin_binding_update(&self, id: &str, update: &PendingBindingUpdate) -> Result<()> {
-        self.connection()?.execute(
+        self.transition(
             "UPDATE bindings SET status = ?1, pending_update = ?2,
-               last_error = NULL, updated_at = ?3 WHERE id = ?4",
+               last_error = NULL, updated_at = ?3
+             WHERE id = ?4 AND status IN ('active', 'degraded')",
             params![
                 BindingStatus::Updating.as_str(),
                 serde_json::to_string(update)?,
                 self.now(),
                 id,
             ],
-        )?;
-        self.invalidate_routes();
-        Ok(())
+        )
     }
 
     pub fn pending_binding_update(&self, id: &str) -> Result<Option<PendingBindingUpdate>> {
@@ -217,11 +219,11 @@ impl Store {
         update: &PendingBindingUpdate,
         receipt: &DnsReceipt,
     ) -> Result<()> {
-        self.connection()?.execute(
+        self.transition(
             "UPDATE bindings SET upstream_scheme = ?1, upstream_port = ?2,
                proxied = ?3, dns_receipt = ?4, pending_update = NULL,
                status = CASE WHEN health = ?5 THEN ?6 ELSE ?7 END,
-               last_error = NULL, updated_at = ?8 WHERE id = ?9",
+               last_error = NULL, updated_at = ?8 WHERE id = ?9 AND status = 'updating'",
             params![
                 update.upstream_scheme,
                 update.upstream_port,
@@ -233,18 +235,15 @@ impl Store {
                 self.now(),
                 id,
             ],
-        )?;
-        self.invalidate_routes();
-        Ok(())
+        )
     }
 
     pub fn begin_binding_removal(&self, id: &str) -> Result<()> {
-        self.connection()?.execute(
-            "UPDATE bindings SET status = ?1, last_error = NULL, updated_at = ?2 WHERE id = ?3",
+        self.transition(
+            "UPDATE bindings SET status = ?1, last_error = NULL, updated_at = ?2
+             WHERE id = ?3 AND status NOT IN ('removing', 'draining', 'updating')",
             params![BindingStatus::Removing.as_str(), self.now(), id],
-        )?;
-        self.invalidate_routes();
-        Ok(())
+        )
     }
 
     pub fn binding_receipt(&self, id: &str) -> Result<Option<DnsReceipt>> {
@@ -262,41 +261,63 @@ impl Store {
     }
 
     pub fn save_binding_removal_receipt(&self, id: &str, receipt: &DnsReceipt) -> Result<()> {
-        self.connection()?.execute(
+        self.transition(
             "UPDATE bindings SET zone_id = ?1, dns_receipt = ?2, dns_plan = NULL,
-               status = ?3, updated_at = ?4 WHERE id = ?5",
+               updated_at = ?3 WHERE id = ?4 AND status = 'removing'",
             params![
                 receipt.zone_id,
                 serde_json::to_string(receipt)?,
-                BindingStatus::Removing.as_str(),
                 self.now(),
                 id,
             ],
-        )?;
-        self.invalidate_routes();
-        Ok(())
+        )
     }
 
     pub fn mark_binding_draining(&self, id: &str, duration: std::time::Duration) -> Result<()> {
-        self.connection()?.execute(
+        self.transition(
             "UPDATE bindings SET status = ?1, drain_until = ?2, pending_update = NULL,
-               dns_plan = NULL, last_error = NULL, updated_at = ?3 WHERE id = ?4",
+               dns_plan = NULL, last_error = NULL, updated_at = ?3
+             WHERE id = ?4 AND status = 'removing'",
             params![
                 BindingStatus::Draining.as_str(),
                 self.now() + duration.as_secs() as i64,
                 self.now(),
                 id,
             ],
-        )?;
-        self.invalidate_routes();
-        Ok(())
+        )
     }
 
-    pub fn delete_binding(&self, id: &str) -> Result<()> {
-        self.connection()?
-            .execute("DELETE FROM bindings WHERE id = ?1", [id])?;
+    /// Puts a binding straight into `status`, skipping the lifecycle guards.
+    #[cfg(test)]
+    pub(crate) fn set_binding_status_for_test(&self, id: &str, status: BindingStatus) {
+        self.connection()
+            .unwrap()
+            .execute(
+                "UPDATE bindings SET status = ?1 WHERE id = ?2",
+                params![status.as_str(), id],
+            )
+            .unwrap();
         self.invalidate_routes();
-        Ok(())
+    }
+
+    /// Drops a binding that never reached the provider (a create refused
+    /// over a DNS conflict).
+    pub fn delete_binding(&self, id: &str) -> Result<()> {
+        self.transition(
+            "DELETE FROM bindings WHERE id = ?1 AND status = 'dns_pending' AND dns_receipt IS NULL",
+            [id],
+        )
+    }
+
+    /// Drops a binding whose drain finished. Returns false if it is not
+    /// draining (already deleted, or a stale timer).
+    pub fn delete_drained_binding(&self, id: &str) -> Result<bool> {
+        let deleted = self.connection()?.execute(
+            "DELETE FROM bindings WHERE id = ?1 AND status = 'draining'",
+            [id],
+        )?;
+        self.invalidate_routes();
+        Ok(deleted > 0)
     }
 
     pub fn draining_bindings(&self) -> Result<Vec<(String, String, i64)>> {

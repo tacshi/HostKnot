@@ -99,7 +99,9 @@ impl Store {
         let Some(table) = self.active_routing_table(hostname)? else {
             return Ok(None);
         };
-        if let Some(route) = best_path_route(&table.path_routes, path) {
+        // Match on the path as the upstream will resolve it, so `/api/../x`
+        // reaches the service that actually serves `/x`.
+        if let Some(route) = best_path_route(&table.path_routes, &routing_path(path)) {
             return Ok(Some(ProxyRoute {
                 binding_id: table.binding.id,
                 path_route_id: Some(route.id.clone()),
@@ -152,20 +154,60 @@ impl Store {
             return Ok(table.clone());
         }
         let Some(binding) = self.binding_for_hostname(hostname)? else {
-            if let Ok(mut cache) = self.route_cache.lock() {
-                cache.insert(cache_key, (Instant::now(), None));
-            }
+            self.cache_route(cache_key, None);
             return Ok(None);
         };
         let table = RoutingTable {
             path_routes: self.list_path_routes(&binding.id)?,
             binding,
         };
-        if let Ok(mut cache) = self.route_cache.lock() {
-            cache.insert(cache_key, (Instant::now(), Some(table.clone())));
-        }
+        self.cache_route(cache_key, Some(table.clone()));
         Ok(Some(table))
     }
+
+    /// Hostnames come straight from clients, so the cache must stay bounded:
+    /// past the cap, expired entries go first, then everything.
+    fn cache_route(&self, key: String, table: Option<RoutingTable>) {
+        let Ok(mut cache) = self.route_cache.lock() else {
+            return;
+        };
+        if cache.len() >= ROUTE_CACHE_CAPACITY {
+            cache.retain(|_, (cached_at, _)| cached_at.elapsed() < ROUTE_CACHE_TTL);
+            if cache.len() >= ROUTE_CACHE_CAPACITY {
+                cache.clear();
+            }
+        }
+        cache.insert(key, (Instant::now(), table));
+    }
+}
+
+const ROUTE_CACHE_CAPACITY: usize = 4096;
+
+/// The request path as an upstream server resolves it: `%2e` decoded to `.`
+/// and dot segments removed (RFC 3986 §5.2.4). Other escapes, including
+/// `%2f`, are left alone because servers do not treat them as separators.
+pub(crate) fn routing_path(path: &str) -> String {
+    let decoded = path.replace("%2e", ".").replace("%2E", ".");
+    let mut output: Vec<&str> = Vec::new();
+    let segments: Vec<&str> = decoded.split('/').skip(1).collect();
+    for (index, segment) in segments.iter().enumerate() {
+        let last = index + 1 == segments.len();
+        match *segment {
+            "." => {
+                if last {
+                    output.push("");
+                }
+            }
+            ".." => {
+                output.pop();
+                if last {
+                    output.push("");
+                }
+            }
+            other => output.push(other),
+        }
+    }
+    format!("/{}", output.join("/"))
 }
 
 fn best_path_route<'a>(routes: &'a [BindingPathRoute], path: &str) -> Option<&'a BindingPathRoute> {
@@ -204,6 +246,39 @@ fn path_route_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BindingPathR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_cache_stays_bounded_under_random_hostnames() {
+        let state = tempfile::TempDir::new().unwrap();
+        let store = Store::open(state.path()).unwrap();
+        for index in 0..(ROUTE_CACHE_CAPACITY * 3) {
+            assert!(
+                store
+                    .active_routing_table(&format!("probe-{index}.example.com"))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(store.route_cache.lock().unwrap().len() <= ROUTE_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn routing_path_resolves_dot_segments_like_an_upstream_would() {
+        assert_eq!(
+            routing_path("/api/../internal/metrics"),
+            "/internal/metrics"
+        );
+        assert_eq!(routing_path("/api/%2e%2e/internal"), "/internal");
+        assert_eq!(routing_path("/api/%2E%2E/%2e/x"), "/x");
+        assert_eq!(routing_path("/assets/./app.css"), "/assets/app.css");
+        assert_eq!(routing_path("/../../etc"), "/etc");
+        assert_eq!(routing_path("/api/v1/.."), "/api/");
+        assert_eq!(routing_path("/api%2f..%2finternal"), "/api%2f..%2finternal");
+        assert_eq!(routing_path("/"), "/");
+        let routes = vec![route("/api")];
+        assert!(best_path_route(&routes, &routing_path("/api/../internal")).is_none());
+        assert!(best_path_route(&routes, &routing_path("/x/../api/users")).is_some());
+    }
 
     #[test]
     fn best_path_route_uses_prefix_specificity_not_input_order() {

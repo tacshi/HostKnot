@@ -84,11 +84,19 @@ impl CertificateResolver {
             ari_checked: RwLock::new(HashMap::new()),
         });
         for certificate in resolver.store.certificates()? {
-            resolver.install_pem(
+            // A damaged certificate is reissued later; it must not stop the
+            // service (and every other binding) from starting.
+            if let Err(error) = resolver.install_pem(
                 &certificate.identifier,
                 &certificate.certificate_pem,
                 &certificate.private_key_pem,
-            )?;
+            ) {
+                tracing::error!(
+                    %error,
+                    identifier = certificate.identifier,
+                    "skipping unusable stored certificate"
+                );
+            }
         }
         Ok(resolver)
     }
@@ -434,6 +442,9 @@ impl CertificateResolver {
                     .unwrap_or(fallback_renew_at),
                 Err(_) => fallback_renew_at,
             };
+            // Install first: it parses the chain and key, so a malformed
+            // issuance is never persisted.
+            self.install_pem(identifier_key, &certificate_pem, &private_key_pem)?;
             self.store.save_certificate(
                 identifier_key,
                 &certificate_pem,
@@ -441,7 +452,6 @@ impl CertificateResolver {
                 not_after,
                 renew_at,
             )?;
-            self.install_pem(identifier_key, &certificate_pem, &private_key_pem)?;
             Result::<()>::Ok(())
         }
         .await;

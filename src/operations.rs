@@ -69,7 +69,6 @@ pub fn install_systemd(options: InstallOptions<'_>) -> Result<()> {
     }
     let binary_path = rooted(options.root, "usr/local/bin/hostknot");
     let config_path = rooted(options.root, "etc/hostknot/config.toml");
-    let state_dir = rooted(options.root, "var/lib/hostknot");
     let unit_path = rooted(options.root, "etc/systemd/system/hostknot.service");
     for directory in [
         binary_path.parent(),
@@ -90,10 +89,9 @@ pub fn install_systemd(options: InstallOptions<'_>) -> Result<()> {
         // silently broke live upgrades. A rename swaps the path atomically
         // while the old inode keeps serving the running process.
         let staged = binary_path.with_extension("staged");
-        fs::copy(options.binary, &staged).with_context(|| {
+        stage_binary(options.binary, &staged).with_context(|| {
             format!("stage {} as {}", options.binary.display(), staged.display())
         })?;
-        set_mode(&staged, 0o755)?;
         fs::rename(&staged, &binary_path)
             .with_context(|| format!("install staged binary as {}", binary_path.display()))?;
     }
@@ -110,7 +108,9 @@ pub fn install_systemd(options: InstallOptions<'_>) -> Result<()> {
             IpAddr::V6(ip) => format!("[{ip}]"),
         };
         let config = FileConfig {
-            state_dir: state_dir.clone(),
+            // The path the service sees at runtime, even when installing
+            // into another root (an image being built, for example).
+            state_dir: PathBuf::from(RUNTIME_STATE_DIR),
             admin_listen: "0.0.0.0:9443".parse().unwrap(),
             http_listen: "0.0.0.0:80".parse().unwrap(),
             https_listen: "0.0.0.0:443".parse().unwrap(),
@@ -137,6 +137,30 @@ pub fn install_systemd(options: InstallOptions<'_>) -> Result<()> {
     }
     fs::write(&unit_path, SYSTEMD_UNIT)?;
     set_mode(&unit_path, 0o644)?;
+    Ok(())
+}
+
+const RUNTIME_STATE_DIR: &str = "/var/lib/hostknot";
+
+/// Copies the new binary into a fresh staging file. `create_new` (O_EXCL)
+/// refuses to follow a symlink planted at the staging path, so the copy can
+/// only ever create a new file next to the target.
+fn stage_binary(source: &Path, staged: &Path) -> Result<()> {
+    match fs::remove_file(staged) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o755);
+    }
+    let mut output = options.open(staged)?;
+    std::io::copy(&mut fs::File::open(source)?, &mut output)?;
+    output.sync_all()?;
     Ok(())
 }
 
@@ -256,6 +280,16 @@ pub async fn doctor(config_path: &Path, offline: bool) -> Result<DoctorReport> {
             &mut failures,
             format!(
                 "state path is not a directory: {}",
+                config.state_dir.display()
+            ),
+        ),
+        // Under DynamicUser the state directory sits behind root-only
+        // /var/lib/private, so without root it is unreadable, not missing.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => fail(
+            &mut checks,
+            &mut failures,
+            format!(
+                "cannot read state directory {} without root; run: sudo hostknot doctor",
                 config.state_dir.display()
             ),
         ),
@@ -398,12 +432,24 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+UMask=0077
 StateDirectoryMode=0700
+# Every listener caps connections well below this.
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
