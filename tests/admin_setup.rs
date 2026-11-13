@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use hostknot::{Clock, Config, HostKnot, RunningHostKnot};
+use hostknot::{AdminAccess, Clock, Config, HostKnot, RunningHostKnot};
 use reqwest::{Client, StatusCode, redirect::Policy};
 use tempfile::TempDir;
 
@@ -457,4 +457,102 @@ fn hidden_value(html: &str, name: &str) -> String {
         .unwrap()
         .0
         .to_owned()
+}
+
+#[tokio::test]
+async fn admin_access_reissues_the_setup_link_until_an_administrator_exists() {
+    let state = TempDir::new().unwrap();
+    let running = HostKnot::start(Config::for_test(
+        state.path(),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+    ))
+    .await
+    .unwrap();
+    let logged_token = running.bootstrap_token().unwrap();
+    let base = format!("http://{}", running.admin_addr());
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .cookie_store(true)
+        .build()
+        .unwrap();
+
+    // `hostknot admin url` against the live service mints a fresh link and
+    // retires the one printed to the journal.
+    let AdminAccess::Setup { token } = HostKnot::admin_access(state.path()).unwrap() else {
+        panic!("an unconfigured install must offer a setup link");
+    };
+    assert_ne!(token, logged_token);
+    let stale = client
+        .get(format!("{base}/setup?token={logged_token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::FORBIDDEN);
+    assert!(stale.text().await.unwrap().contains("hostknot admin url"));
+
+    let setup = client
+        .post(format!("{base}/setup"))
+        .form(&[
+            ("token", token.as_str()),
+            ("password", "correct horse battery staple"),
+            ("acme_email", "operator@example.com"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(setup.status(), StatusCode::SEE_OTHER);
+
+    // Once configured, the command only points at the sign-in page and must
+    // not open a second setup path.
+    assert_eq!(
+        HostKnot::admin_access(state.path()).unwrap(),
+        AdminAccess::SignIn
+    );
+    running.shutdown().await;
+}
+
+#[tokio::test]
+async fn setup_validation_errors_keep_the_link_usable() {
+    let state = TempDir::new().unwrap();
+    let running = HostKnot::start(Config::for_test(
+        state.path(),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+    ))
+    .await
+    .unwrap();
+    let token = running.bootstrap_token().unwrap();
+    let base = format!("http://{}", running.admin_addr());
+    let client = Client::builder().redirect(Policy::none()).build().unwrap();
+
+    let short = client
+        .post(format!("{base}/setup"))
+        .form(&[
+            ("token", token.as_str()),
+            ("password", "too short"),
+            ("acme_email", "operator@example.com"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(short.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        short
+            .text()
+            .await
+            .unwrap()
+            .contains("at least 12 characters")
+    );
+
+    let retry = client
+        .post(format!("{base}/setup"))
+        .form(&[
+            ("token", token.as_str()),
+            ("password", "correct horse battery staple"),
+            ("acme_email", "operator@example.com"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::SEE_OTHER);
+    running.shutdown().await;
 }

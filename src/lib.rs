@@ -4,6 +4,7 @@ mod certificates;
 mod clock;
 mod cloudflare;
 mod crypto;
+pub mod logs;
 mod model;
 pub mod operations;
 mod provider;
@@ -312,6 +313,17 @@ impl HostKnot {
         })
     }
 
+    /// Reports how an operator gets into the admin panel. Setup tokens are
+    /// stored only as hashes, so an unconfigured install gets a freshly issued
+    /// token (replacing any earlier one) rather than a recovered copy.
+    pub fn admin_access(state_dir: impl AsRef<Path>) -> Result<AdminAccess> {
+        let store = Store::open(state_dir.as_ref())?;
+        Ok(match store.issue_bootstrap_if_unconfigured()? {
+            Some(token) => AdminAccess::Setup { token },
+            None => AdminAccess::SignIn,
+        })
+    }
+
     pub fn reset_admin(state_dir: impl AsRef<Path>) -> Result<String> {
         let store = Store::open(state_dir.as_ref())?;
         store.reset_administrator()?;
@@ -319,6 +331,21 @@ impl HostKnot {
             .issue_bootstrap_if_unconfigured()?
             .context("failed to issue administrator reset token")
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdminAccess {
+    /// No administrator exists yet; this one-time token opens `/setup`.
+    Setup { token: String },
+    /// An administrator exists; sign in with its password.
+    SignIn,
+}
+
+/// Builds the one-time setup link for a token.
+pub fn setup_url(admin_public_url: &url::Url, token: &str) -> Result<url::Url> {
+    let mut url = admin_public_url.join("setup")?;
+    url.query_pairs_mut().append_pair("token", token);
+    Ok(url)
 }
 
 pub struct RunningHostKnot {

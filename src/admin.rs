@@ -22,8 +22,9 @@ use self::security::{
     require_csrf, security_headers, session_redirect,
 };
 use self::views::{
-    HtmlStatus, binding_edit_page, discover_listening_ports, error_page, escape_html,
-    format_timestamp, page, page_with_head, title_status,
+    FAVICON_SVG, HtmlStatus, ICON_ALERT, ICON_CHECK, ICON_LOCK, Nav, app_page, auth_page,
+    back_link, binding_edit_page, dashboard_page, discover_listening_ports, error_page,
+    escape_html, notice, page, page_with_head, protocol_select,
 };
 
 use crate::{
@@ -74,6 +75,7 @@ impl AdminState {
 pub fn router(state: Arc<AdminState>) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/favicon.svg", get(favicon))
         .route("/setup", get(setup_page).post(setup))
         .route("/login", get(login_page).post(login))
         .route("/logout", axum::routing::post(logout))
@@ -140,98 +142,6 @@ async fn index(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Resp
     let refresh = refresh_after
         .map(|seconds| format!(r#"<meta http-equiv="refresh" content="{seconds}">"#))
         .unwrap_or_default();
-    let content = if bindings.is_empty() {
-        r#"<section class="empty"><h2>No bindings yet</h2><p>Connect a DNS provider, then bind a hostname to a local port.</p></section>"#.to_owned()
-    } else {
-        let rows = bindings
-            .iter()
-            .map(|binding| {
-                let draining = binding.status == BindingStatus::Draining;
-                let health = if draining {
-                    "Cached traffic is still served briefly".to_owned()
-                } else {
-                    title_status(binding.health.as_str())
-                };
-                let health_error = if binding.status == BindingStatus::Degraded {
-                    binding
-                        .last_error
-                        .as_deref()
-                        .map(|error| {
-                            format!(
-                                r#"<small class="health-error">{}</small>"#,
-                                escape_html(error)
-                            )
-                        })
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                let certificate = if draining {
-                    "Retained during drain".to_owned()
-                } else {
-                    let error = if binding.status == BindingStatus::Degraded {
-                        String::new()
-                    } else {
-                        binding
-                            .last_error
-                            .as_deref()
-                            .map(escape_html)
-                            .unwrap_or_default()
-                    };
-                    format!(
-                        "{}<small>{}</small>",
-                        title_status(binding.certificate_status.as_str()),
-                        error
-                    )
-                };
-                let dns = if draining {
-                    "Released".to_owned()
-                } else if binding.proxied {
-                    "Cloudflare proxied".to_owned()
-                } else {
-                    "DNS only".to_owned()
-                };
-                let actions = if matches!(
-                    binding.status,
-                    BindingStatus::Removing | BindingStatus::Draining
-                ) {
-                    r#"<span class="muted">Removal in progress</span>"#.to_owned()
-                } else if binding.status == BindingStatus::Updating {
-                    r#"<span class="muted">Update in progress</span>"#.to_owned()
-                } else if !binding.status.is_editable() {
-                    format!(
-                        r#"<form class="inline" method="post" action="/bindings/{}/remove"><input type="hidden" name="csrf" value="{}"><button class="danger" type="submit">Unbind</button></form>"#,
-                        binding.id,
-                        escape_html(&csrf)
-                    )
-                } else {
-                    format!(
-                        r#"<div class="row-actions"><a class="button secondary" href="/bindings/{}/edit">Edit</a><form class="inline" method="post" action="/bindings/{}/remove"><input type="hidden" name="csrf" value="{}"><button class="danger" type="submit">Unbind</button></form></div>"#,
-                        binding.id,
-                        binding.id,
-                        escape_html(&csrf)
-                    )
-                };
-                format!(
-                    r#"<tr data-binding-id="{}"><td data-label="Hostname"><strong>{}</strong></td><td data-label="Upstream"><code class="upstream">{}://127.0.0.1:{}</code></td><td data-label="Status / health"><span class="pill {}">{}</span><small>{}</small>{}</td><td data-label="Certificate">{}</td><td data-label="DNS">{}</td><td class="actions" data-label="Actions">{}</td></tr>"#,
-                    binding.id,
-                    escape_html(&binding.hostname),
-                    binding.upstream_scheme,
-                    binding.upstream_port,
-                    binding.status.as_str(),
-                    title_status(binding.status.as_str()),
-                    health,
-                    health_error,
-                    certificate,
-                    dns,
-                    actions
-                )
-            })
-            .collect::<String>();
-        format!(
-            r#"<section class="table"><table><thead><tr><th>Hostname</th><th>Upstream</th><th>Status / health</th><th>Certificate</th><th>DNS</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table></section>"#
-        )
-    };
     let mut grouped: Vec<(crate::store::Event, u32)> = Vec::new();
     for event in state.store.recent_events(50).unwrap_or_default() {
         if let Some((last, count)) = grouped.last_mut()
@@ -243,31 +153,70 @@ async fn index(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Resp
             grouped.push((event, 1));
         }
     }
-    let events = grouped
-        .into_iter()
-        .take(15)
-        .map(|(event, count)| {
-            let repeat = if count > 1 {
-                format!(r#" <span class="repeat">×{count}</span>"#)
-            } else {
-                String::new()
-            };
-            format!(
-                r#"<li><span class="tag">{}</span><span class="event-message">{}{repeat}</span><time>{}</time></li>"#,
-                escape_html(&event.kind),
-                escape_html(&event.message),
-                format_timestamp(event.created_at)
-            )
-        })
-        .collect::<String>();
-    let history =
-        format!("<section class=\"events\"><h2>Event history</h2><ol>{events}</ol></section>");
-    Html(page_with_head(
-        "HostKnot",
+    grouped.truncate(15);
+    Html(dashboard_page(
+        &bindings,
+        &grouped,
+        state.cloudflare.connected(),
+        &csrf,
         &refresh,
-        &format!(r#"<main><header><div><span class="eyebrow">HostKnot</span><h1>Domain bindings</h1></div><nav><a href="/providers/cloudflare">Cloudflare</a><a class="button" href="/bindings/new">New binding</a><form class="inline" method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button type="submit">Sign out</button></form></nav></header>{content}{history}</main>"#, escape_html(&csrf)),
     ))
     .into_response()
+}
+
+async fn favicon() -> Response {
+    ([(header::CONTENT_TYPE, "image/svg+xml")], FAVICON_SVG).into_response()
+}
+
+/// Setup links are single-use and short-lived, so a dead one points the
+/// operator at the CLI that mints a fresh link.
+fn expired_setup_link() -> Response {
+    Html(page(
+        "Setup link expired",
+        &notice(
+            "warn",
+            "First run",
+            "This setup link no longer works",
+            "Setup links work once and expire after an hour. On the server, run <code>hostknot admin url</code> to get a fresh one.",
+            "",
+        ),
+    ))
+    .into_response_with_status(StatusCode::FORBIDDEN)
+}
+
+fn setup_form(token: &str, error: Option<&str>) -> String {
+    let error = error
+        .map(|error| {
+            format!(
+                r#"<div class="form-error" role="alert">{ICON_ALERT}<span>{}</span></div>"#,
+                escape_html(error)
+            )
+        })
+        .unwrap_or_default();
+    auth_page(
+        "Create administrator",
+        &format!(
+            r#"<form class="card" method="post" action="/setup"><span class="eyebrow">First run</span><h1>Create administrator</h1><p>This account manages DNS providers and domain bindings on this server.</p>{error}<input type="hidden" name="token" value="{}"><label>Password<input name="password" type="password" minlength="12" autocomplete="new-password" required autofocus><small class="form-help">At least 12 characters.</small></label><label>ACME contact email<input name="acme_email" type="email" autocomplete="email" required><small class="form-help">Let’s Encrypt sends certificate notices here.</small></label><button type="submit">Finish setup</button></form>"#,
+            escape_html(token)
+        ),
+    )
+}
+
+fn login_form(error: Option<&str>) -> String {
+    let error = error
+        .map(|error| {
+            format!(
+                r#"<div class="form-error" role="alert">{ICON_ALERT}<span>{}</span></div>"#,
+                escape_html(error)
+            )
+        })
+        .unwrap_or_default();
+    auth_page(
+        "Sign in",
+        &format!(
+            r#"<form class="card" method="post" action="/login"><h1>Sign in</h1><p>Enter the administrator password for this server.</p>{error}<label>Password<input name="password" type="password" autocomplete="current-password" required autofocus></label><button type="submit">Sign in</button></form><p class="auth-foot">Forgot it? Run <code>hostknot admin reset</code> on the server.</p>"#
+        ),
+    )
 }
 
 async fn setup_page(
@@ -279,16 +228,9 @@ async fn setup_page(
     }
     let token = query.get("token").cloned().unwrap_or_default();
     if !state.store.bootstrap_valid(&token).unwrap_or(false) {
-        return (StatusCode::FORBIDDEN, "Invalid setup token").into_response();
+        return expired_setup_link();
     }
-    Html(page(
-        "Create administrator",
-        &format!(
-            r#"<main class="narrow"><span class="eyebrow">FIRST RUN</span><h1>Create administrator</h1><p>Use this account to manage providers and domain bindings.</p><form method="post" action="/setup"><input type="hidden" name="token" value="{}"><label>Password<input name="password" type="password" minlength="12" autocomplete="new-password" required></label><label>ACME contact email<input name="acme_email" type="email" autocomplete="email" required></label><button type="submit">Finish setup</button></form></main>"#,
-            escape_html(&token)
-        ),
-    ))
-    .into_response()
+    Html(setup_form(&token, None)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -309,7 +251,13 @@ async fn setup(State(state): State<Arc<AdminState>>, Form(form): Form<SetupForm>
             }
             session_redirect(&session, state.secure_cookies, "/")
         }
-        Err(_) => (StatusCode::FORBIDDEN, "Setup failed").into_response(),
+        // With a still-valid token the input itself was rejected; show why
+        // and let the operator correct it.
+        Err(error) if state.store.bootstrap_valid(&form.token).unwrap_or(false) => {
+            Html(setup_form(&form.token, Some(&error.to_string())))
+                .into_response_with_status(StatusCode::BAD_REQUEST)
+        }
+        Err(_) => expired_setup_link(),
     }
 }
 
@@ -317,11 +265,7 @@ async fn login_page(State(state): State<Arc<AdminState>>) -> Response {
     if !state.store.is_configured().unwrap_or(false) {
         return Redirect::to("/setup").into_response();
     }
-    Html(page(
-        "Sign in",
-        r#"<main class="narrow"><span class="eyebrow">HostKnot</span><h1>Sign in</h1><form method="post" action="/login"><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button type="submit">Sign in</button></form></main>"#,
-    ))
-    .into_response()
+    Html(login_form(None)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -337,8 +281,10 @@ async fn login(
     // Throttling is keyed per client IP so an attacker cannot lock the real
     // operator out of the only management surface.
     if login_is_throttled(&state, peer_ip) {
-        let mut response =
-            (StatusCode::TOO_MANY_REQUESTS, "Too many login attempts").into_response();
+        let mut response = Html(login_form(Some(
+            "Too many failed attempts from this address. Wait five minutes and try again.",
+        )))
+        .into_response_with_status(StatusCode::TOO_MANY_REQUESTS);
         response
             .headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from_static("300"));
@@ -350,7 +296,8 @@ async fn login(
             "security",
             &format!("Failed administrator login from {peer_ip}"),
         );
-        return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
+        return Html(login_form(Some("That password is incorrect.")))
+            .into_response_with_status(StatusCode::UNAUTHORIZED);
     }
     state.failed_logins.lock().unwrap().remove(&peer_ip);
     match state.store.create_session() {
@@ -386,31 +333,42 @@ async fn cloudflare_page(State(state): State<Arc<AdminState>>, headers: HeaderMa
     let connected = state.cloudflare.connected();
     let status = if connected {
         format!(
-            r#"<div class="status good"><strong>Connected</strong><span>Cloudflare can manage DNS records.</span></div><form class="inline" method="post" action="/providers/cloudflare/disconnect"><input type="hidden" name="csrf" value="{}"><button class="danger" type="submit">Disconnect</button></form>"#,
+            r#"<section class="card status-card good"><div class="status-icon">{ICON_CHECK}</div><div class="status-text"><strong>Connected</strong><span>Cloudflare can manage DNS records.</span></div><form class="inline" method="post" action="/providers/cloudflare/disconnect"><input type="hidden" name="csrf" value="{}"><button class="danger small" type="submit">Disconnect</button></form></section>"#,
             escape_html(&csrf)
         )
     } else if configured {
-        r#"<div class="status"><strong>OAuth client saved</strong><span>Authorize Cloudflare to finish connecting.</span></div>"#.to_owned()
+        format!(
+            r#"<section class="card status-card pending"><div class="status-icon">{ICON_LOCK}</div><div class="status-text"><strong>OAuth client saved</strong><span>Authorize Cloudflare to finish connecting.</span></div></section>"#
+        )
     } else {
-        r#"<div class="status"><strong>Not configured</strong><span>Create a private Cloudflare OAuth client first.</span></div>"#.to_owned()
+        format!(
+            r#"<section class="card status-card"><div class="status-icon">{ICON_LOCK}</div><div class="status-text"><strong>Not configured</strong><span>Create a private Cloudflare OAuth client first.</span></div></section>"#
+        )
     };
     let callback = escape_html(state.cloudflare.callback_url().as_str());
+    let credentials_fields = r#"<input type="hidden" name="scopes" value="zone.read dns.write offline_access"><label>Client ID<input name="client_id" autocomplete="off" spellcheck="false" required></label><label>Client secret<input name="client_secret" type="password" autocomplete="off" required></label>"#;
     let flow = if connected {
         String::new()
     } else if configured {
         format!(
-            r#"<section class="instructions next-step"><span class="step-label">STEP 3 · CLOUDFLARE</span><h2>Authorize Cloudflare</h2><p>Open Cloudflare, review the requested DNS permissions, and approve access.</p><a class="button" href="/providers/cloudflare/connect">Authorize with Cloudflare</a></section><details class="reconfigure"><summary>Change OAuth client credentials</summary><form method="post" action="/providers/cloudflare/configure"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="scopes" value="zone.read dns.write offline_access"><h2>Replace saved credentials</h2><label>Client ID<input name="client_id" required></label><label>Client secret<input name="client_secret" type="password" autocomplete="off" required></label><button type="submit">Save OAuth client</button></form></details>"#,
+            r#"<section class="card step"><div class="step-head"><span class="step-num">3</span><div><span class="step-label">In Cloudflare</span><h2>Authorize Cloudflare</h2></div></div><p>Open Cloudflare, review the requested DNS permissions, and approve access.</p><div class="step-actions"><a class="button" href="/providers/cloudflare/connect">Authorize with Cloudflare</a></div></section><details class="reconfigure"><summary>Change OAuth client credentials</summary><form class="card" method="post" action="/providers/cloudflare/configure"><input type="hidden" name="csrf" value="{}"><div class="form-title"><h2>Replace saved credentials</h2></div>{credentials_fields}<div class="form-actions"><button type="submit">Save OAuth client</button></div></form></details>"#,
             escape_html(&csrf)
         )
     } else {
         format!(
-            r#"<p class="provider-actions"><a class="button" href="https://dash.cloudflare.com/?to=%2F%3Aaccount%2Foauth-clients" target="_blank" rel="noopener noreferrer">Create OAuth client in Cloudflare ↗</a></p><section class="instructions"><span class="step-label">STEP 1 · CLOUDFLARE</span><h2>Use these OAuth settings</h2><p>Enter these values on Cloudflare's <strong>Configure OAuth client</strong> screen.</p><dl class="oauth-settings"><div><dt>Client name</dt><dd>HostKnot</dd></div><div><dt>Response type</dt><dd>Code</dd></div><div><dt>Grant types</dt><dd>Authorization Code + Refresh Token</dd></div><div><dt>Token authentication</dt><dd>Client Secret Basic</dd></div><div class="wide"><dt>Redirect (Callback) URL</dt><dd><code>{callback}</code></dd></div></dl><p><strong>After Continue:</strong> select <strong>Zone · Read</strong> and <strong>DNS · Edit</strong>. Keep the client <strong>Private</strong> and leave Client URL blank. Cloudflare's “Client URL required” badge only matters if you later make the client public.</p></section><form method="post" action="/providers/cloudflare/configure"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="scopes" value="zone.read dns.write offline_access"><span class="step-label">STEP 2 · HostKnot</span><h2>Paste the generated credentials</h2><p>Cloudflare shows the client secret once. Copy both values before leaving the page.</p><label>Client ID<input name="client_id" required></label><label>Client secret<input name="client_secret" type="password" autocomplete="off" required></label><button type="submit">Save OAuth client</button></form>"#,
+            r#"<section class="card step"><div class="step-head"><span class="step-num">1</span><div><span class="step-label">In Cloudflare</span><h2>Use these OAuth settings</h2></div></div><p>Create an OAuth client, then enter these values on Cloudflare's <strong>Configure OAuth client</strong> screen.</p><p class="step-actions"><a class="button secondary" href="https://dash.cloudflare.com/?to=%2F%3Aaccount%2Foauth-clients" target="_blank" rel="noopener noreferrer">Create OAuth client in Cloudflare ↗</a></p><dl class="oauth-settings"><div><dt>Client name</dt><dd>HostKnot</dd></div><div><dt>Response type</dt><dd>Code</dd></div><div><dt>Grant types</dt><dd>Authorization Code + Refresh Token</dd></div><div><dt>Token authentication</dt><dd>Client Secret Basic</dd></div><div class="wide"><dt>Redirect (Callback) URL</dt><dd><code>{callback}</code></dd></div></dl><p><strong>After Continue:</strong> select <strong>Zone · Read</strong> and <strong>DNS · Edit</strong>. Keep the client <strong>Private</strong> and leave Client URL blank. Cloudflare's “Client URL required” badge only matters if you later make the client public.</p></section><form class="card step" method="post" action="/providers/cloudflare/configure"><input type="hidden" name="csrf" value="{}"><div class="step-head"><span class="step-num">2</span><div><span class="step-label">In HostKnot</span><h2>Paste the generated credentials</h2></div></div><p>Cloudflare shows the client secret once. Copy both values before leaving the page.</p>{credentials_fields}<div class="form-actions"><button type="submit">Save OAuth client</button></div></form>"#,
             escape_html(&csrf)
         )
     };
-    Html(page(
+    Html(app_page(
         "Cloudflare",
-        &format!(r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">DNS PROVIDER</span><h1>Cloudflare</h1>{status}{flow}</main>"#),
+        "",
+        Nav::Cloudflare,
+        &csrf,
+        &format!(
+            r#"<main class="narrow">{back}<div class="page-head"><div><span class="eyebrow">DNS provider</span><h1>Cloudflare</h1><p>HostKnot manages A and AAAA records in your Cloudflare zones through a private OAuth client.</p></div></div>{status}{flow}</main>"#,
+            back = back_link("/", "Bindings"),
+        ),
     ))
     .into_response()
 }
@@ -507,7 +465,13 @@ async fn start_cloudflare_connect(
     Html(page_with_head(
         "Continue to Cloudflare",
         r#"<meta http-equiv="refresh" content="0;url=/providers/cloudflare/connect">"#,
-        r#"<main class="narrow"><span class="eyebrow">DNS PROVIDER</span><h1>Opening Cloudflare</h1><p>If authorization does not open automatically, continue below.</p><p><a class="button" href="/providers/cloudflare/connect">Authorize with Cloudflare</a></p></main>"#,
+        &views::bare(&notice(
+            "info",
+            "DNS provider",
+            "Opening Cloudflare",
+            "If authorization does not open automatically, continue below.",
+            r#"<div class="notice-actions"><a class="button" href="/providers/cloudflare/connect">Authorize with Cloudflare</a></div>"#,
+        )),
     ))
     .into_response()
 }
@@ -534,23 +498,35 @@ async fn cloudflare_callback(
     }
     if let Some(error) = query.error {
         let Some(oauth_state) = query.state else {
-            return (StatusCode::BAD_REQUEST, "Incomplete OAuth cancellation").into_response();
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                "Cloudflare authorization was cancelled",
+                "The response from Cloudflare was incomplete. Start the connection again from the Cloudflare page.",
+            );
         };
         if state
             .cloudflare
             .cancel_authorization(&oauth_state, session)
             .is_err()
         {
-            return (StatusCode::BAD_REQUEST, "Invalid OAuth cancellation state").into_response();
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                "Cloudflare authorization was cancelled",
+                "This authorization attempt is no longer valid. Start the connection again from the Cloudflare page.",
+            );
         }
-        return (
+        return error_page(
             StatusCode::BAD_REQUEST,
-            format!("Cloudflare authorization failed: {}", escape_html(&error)),
-        )
-            .into_response();
+            "Cloudflare authorization failed",
+            &format!("Cloudflare returned: {error}"),
+        );
     }
     let (Some(code), Some(oauth_state)) = (query.code, query.state) else {
-        return (StatusCode::BAD_REQUEST, "Incomplete OAuth callback").into_response();
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "Cloudflare authorization failed",
+            "The response from Cloudflare was incomplete. Start the connection again from the Cloudflare page.",
+        );
     };
     match state
         .cloudflare
@@ -561,11 +537,11 @@ async fn cloudflare_callback(
             state.bindings.nudge_reconciliation();
             Redirect::to("/providers/cloudflare").into_response()
         }
-        Err(_) => (
+        Err(_) => error_page(
             StatusCode::BAD_REQUEST,
             "Cloudflare authorization could not be completed",
-        )
-            .into_response(),
+            "Cloudflare did not accept the authorization. Check the OAuth client settings and try again.",
+        ),
     }
 }
 
@@ -578,11 +554,16 @@ async fn new_binding_page(State(state): State<Arc<AdminState>>, headers: HeaderM
         .filter(|port| state.bindings.port_is_bindable(*port))
         .map(|port| format!(r#"<option value="{port}"></option>"#))
         .collect::<String>();
-    Html(page(
+    Html(app_page(
         "New binding",
+        "",
+        Nav::Bindings,
+        &csrf,
         &format!(
-            r#"<main class="narrow"><a href="/">← Bindings</a><span class="eyebrow block">NEW ROUTE</span><h1>Bind a domain</h1><form method="post" action="/bindings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="replace_existing" value="false"><div class="managed-tls"><strong>Public HTTPS included</strong><span>HostKnot obtains and renews the domain certificate automatically.</span></div><label>Hostname<input name="hostname" placeholder="app.example.com" required><small class="form-help">The exact domain visitors will use. Its zone must be in your connected Cloudflare account.</small></label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" list="ports" required><datalist id="ports">{ports}</datalist><small class="form-help">The loopback port your service listens on — detected listeners are suggested as you type.</small></label><details class="local-options"><summary>Local connection options</summary><label>Local service protocol<select name="upstream_scheme"><option value="http" selected>HTTP</option><option value="https">HTTPS</option></select><small class="form-help">Use HTTPS only when the local service itself requires it. Private and self-signed loopback certificates are accepted automatically.</small></label></details><label class="check"><input name="proxied" type="checkbox" value="true" checked> Enable Cloudflare proxy</label><small class="form-help check-help">Serves traffic through Cloudflare’s network and hides this server’s IP; your app still sees the real visitor address. Uncheck for direct DNS records.</small><button type="submit">Bind domain</button></form></main>"#,
-            escape_html(&csrf)
+            r#"<main class="narrow">{back}<div class="page-head"><div><h1>Bind a domain</h1><p>Route a hostname to a service listening on this server.</p></div></div><form class="card" method="post" action="/bindings"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="replace_existing" value="false"><div class="callout">{ICON_LOCK}<div><strong>Public HTTPS included</strong><span>HostKnot obtains and renews the domain certificate automatically.</span></div></div><label>Hostname<input name="hostname" placeholder="app.example.com" autocomplete="off" autocapitalize="off" spellcheck="false" required autofocus><small class="form-help">The exact domain visitors will use. Its zone must be in your connected Cloudflare account.</small></label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" list="ports" placeholder="3000" required><datalist id="ports">{ports}</datalist><small class="form-help">The loopback port your service listens on — detected listeners are suggested as you type.</small></label><details class="local-options"><summary>Local connection options</summary><label>Local service protocol{protocol}<small class="form-help">Use HTTPS only when the local service itself requires it. Private and self-signed loopback certificates are accepted automatically.</small></label></details><label class="check"><input name="proxied" type="checkbox" value="true" checked> Enable Cloudflare proxy</label><small class="form-help check-help">Serves traffic through Cloudflare’s network and hides this server’s IP; your app still sees the real visitor address. Turn off for direct DNS records.</small><div class="form-actions"><a class="button ghost" href="/">Cancel</a><button type="submit">Bind domain</button></div></form></main>"#,
+            back = back_link("/", "Bindings"),
+            csrf = escape_html(&csrf),
+            protocol = protocol_select("http"),
         ),
     ))
     .into_response()
@@ -623,17 +604,29 @@ async fn create_binding(
             }
             Redirect::to("/providers/cloudflare/connect/start").into_response()
         }
-        Err(error) if crate::provider::is_conflict(&error) => Html(page(
-            "Confirm DNS replacement",
-            &format!(
-                r#"<main class="narrow"><span class="eyebrow">DNS CONFLICT</span><h1>Replace existing records?</h1><p>Replace existing records only if they should point to this VPS. HostKnot will save them and restore them on unbind.</p><form method="post" action="/bindings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="hostname" value="{}"><input type="hidden" name="upstream_scheme" value="{}"><input type="hidden" name="upstream_port" value="{}"><input type="hidden" name="proxied" value="{}"><input type="hidden" name="replace_existing" value="true"><button class="danger" type="submit">Replace existing records</button></form></main>"#,
-                escape_html(&form.csrf),
-                escape_html(&input.hostname),
-                escape_html(&input.upstream_scheme),
-                input.upstream_port,
-                input.proxied
-            ),
-        )).into_response_with_status(StatusCode::CONFLICT),
+        Err(error) if crate::provider::is_conflict(&error) => {
+            let hostname = escape_html(&input.hostname);
+            Html(app_page(
+                "Confirm DNS replacement",
+                "",
+                Nav::Bindings,
+                &form.csrf,
+                &notice(
+                    "warn",
+                    "DNS conflict",
+                    "Replace existing records?",
+                    &format!("<strong>{hostname}</strong> already has DNS records. Replace them only if they should point to this server. HostKnot saves them and restores them on unbind."),
+                    &format!(
+                        r#"<form method="post" action="/bindings"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="hostname" value="{hostname}"><input type="hidden" name="upstream_scheme" value="{}"><input type="hidden" name="upstream_port" value="{}"><input type="hidden" name="proxied" value="{}"><input type="hidden" name="replace_existing" value="true"><a class="button ghost" href="/bindings/new">Cancel</a><button class="danger solid" type="submit">Replace existing records</button></form>"#,
+                        escape_html(&form.csrf),
+                        escape_html(&input.upstream_scheme),
+                        input.upstream_port,
+                        input.proxied
+                    ),
+                ),
+            ))
+            .into_response_with_status(StatusCode::CONFLICT)
+        }
         Err(error) => error_page(
             StatusCode::BAD_REQUEST,
             "Couldn't bind that domain",
@@ -762,28 +755,21 @@ async fn edit_path_route_page(
     if route.binding_id != binding.id {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let http_selected = if route.upstream_scheme == "http" {
-        " selected"
-    } else {
-        ""
-    };
-    let https_selected = if route.upstream_scheme == "https" {
-        " selected"
-    } else {
-        ""
-    };
-    Html(page(
+    Html(app_page(
         "Edit path route",
+        "",
+        Nav::Bindings,
+        &csrf,
         &format!(
-            r#"<main class="narrow"><a href="/bindings/{}/edit">← {}</a><span class="eyebrow block">EDIT PATH ROUTE</span><h1>{}</h1><form method="post" action="/bindings/{}/routes/{}"><input type="hidden" name="csrf" value="{}"><label>Path prefix<input name="path_prefix" value="{}" required><small class="form-help">The complete request path is preserved. Trailing slashes are normalized.</small></label><label>Local service protocol<select name="upstream_scheme"><option value="http"{http_selected}>HTTP</option><option value="https"{https_selected}>HTTPS</option></select></label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" value="{}" required></label><button type="submit">Save path route</button></form></main>"#,
-            binding.id,
-            escape_html(&binding.hostname),
-            escape_html(&route.path_prefix),
-            binding.id,
-            route.id,
-            escape_html(&csrf),
-            escape_html(&route.path_prefix),
-            route.upstream_port,
+            r#"<main class="narrow">{back}<div class="page-head"><div><span class="eyebrow">Path route</span><h1>{path}</h1><p>Requests to <strong>{hostname}</strong> under this prefix go to the service below.</p></div></div><form class="card" method="post" action="/bindings/{binding_id}/routes/{route_id}"><input type="hidden" name="csrf" value="{csrf}"><label>Path prefix<input name="path_prefix" value="{path}" autocomplete="off" spellcheck="false" required><small class="form-help">The complete request path is preserved. Trailing slashes are normalized.</small></label><div class="field-row"><label>Local service protocol{protocol}</label><label>Local port<input name="upstream_port" type="number" min="1" max="65535" value="{port}" required></label></div><div class="form-actions"><a class="button ghost" href="/bindings/{binding_id}/edit">Cancel</a><button type="submit">Save path route</button></div></form></main>"#,
+            back = back_link(&format!("/bindings/{}/edit", binding.id), &escape_html(&binding.hostname)),
+            hostname = escape_html(&binding.hostname),
+            path = escape_html(&route.path_prefix),
+            binding_id = binding.id,
+            route_id = route.id,
+            csrf = escape_html(&csrf),
+            protocol = protocol_select(&route.upstream_scheme),
+            port = route.upstream_port,
         ),
     ))
     .into_response()
