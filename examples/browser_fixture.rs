@@ -47,6 +47,7 @@ async fn main() -> Result<()> {
         println!("http://{}/setup?token={token}", running.admin_addr());
     }
     println!("upstream-port: {upstream_port}");
+    println!("proxy-https: {}", running.https_addr());
     tokio::signal::ctrl_c().await?;
     running.shutdown().await;
     Ok(())

@@ -15,6 +15,26 @@ HostKnot is a single Rust binary that turns "I deployed a service on port 3000, 
 
 Everything persists in one SQLite database with encrypted credentials, survives restarts, and installs as a hardened systemd service.
 
+## Screenshots
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/dashboard-dark.png">
+  <img src="assets/screenshots/dashboard-light.png" alt="HostKnot dashboard listing four domain bindings with their upstreams, status, certificates, and DNS mode">
+</picture>
+
+<table>
+  <tr>
+    <td width="33%"><img src="assets/screenshots/new-binding.png" alt="Binding a new domain to a local port"></td>
+    <td width="33%"><img src="assets/screenshots/binding.png" alt="Editing a binding's default upstream and path routes"></td>
+    <td width="33%"><img src="assets/screenshots/cloudflare.png" alt="Guided Cloudflare OAuth setup"></td>
+  </tr>
+  <tr>
+    <td align="center">Bind a domain</td>
+    <td align="center">Upstream and path routes</td>
+    <td align="center">Guided Cloudflare setup</td>
+  </tr>
+</table>
+
 ## How it works
 
 ```
@@ -178,6 +198,8 @@ Browser tests (Playwright, drives a real HostKnot process through setup, OAuth, 
 npm ci && npx playwright install chromium
 npm run test:browser
 ```
+
+Regenerate the README screenshots (same fixture, real proxied traffic) with `npm run screenshots`.
 
 ACME issuance and renewal against a local [Pebble](https://github.com/letsencrypt/pebble) server:
 
