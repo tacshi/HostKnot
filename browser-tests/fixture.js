@@ -23,7 +23,7 @@ export async function startFixture() {
     },
     stdio: ["ignore", "pipe", "inherit"]
   });
-  const { setupUrl, upstreamPort } = await new Promise((resolve, reject) => {
+  const { setupUrl, upstreamPort, proxyHttps } = await new Promise((resolve, reject) => {
     let output = "";
     const timeout = setTimeout(
       () => reject(new Error("HostKnot fixture did not start")),
@@ -36,15 +36,21 @@ export async function startFixture() {
       output += chunk.toString();
       const setupMatch = output.match(/http:\/\/[^\s]+\/setup\?token=[^\s]+/);
       const portMatch = output.match(/upstream-port: (\d+)/);
-      if (setupMatch && portMatch) {
+      const proxyMatch = output.match(/proxy-https: (\S+)/);
+      if (setupMatch && portMatch && proxyMatch) {
         clearTimeout(timeout);
-        resolve({ setupUrl: setupMatch[0], upstreamPort: Number(portMatch[1]) });
+        resolve({
+          setupUrl: setupMatch[0],
+          upstreamPort: Number(portMatch[1]),
+          proxyHttps: proxyMatch[1]
+        });
       }
     });
   });
   return {
     setupUrl,
     upstreamPort,
+    proxyHttps,
     baseUrl: setupUrl.replace(/\/setup.*$/, ""),
     async stop() {
       processHandle.kill("SIGINT");

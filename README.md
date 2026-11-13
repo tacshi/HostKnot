@@ -1,15 +1,39 @@
-# HostKnot
+<p align="center">
+  <img src="assets/logo.svg" width="88" height="88" alt="HostKnot logo">
+</p>
 
-**Bind a domain to any service on your VPS from your browser — no Nginx, no Caddy, no config files to hand-edit.**
+<h1 align="center">HostKnot</h1>
+
+<p align="center"><strong>Bind a domain to any service on your VPS from your browser — no Nginx, no Caddy, no config files to hand-edit.</strong></p>
 
 HostKnot is a single Rust binary that turns "I deployed a service on port 3000, now I want `app.example.com` pointing at it with HTTPS" into a two-minute browser workflow. It combines four things that normally require separate tools:
 
 - **A reverse proxy** on ports 80/443 with exact-host and optional path-prefix routing, HTTP/2, WebSockets, server-sent events, and streaming.
 - **Automatic DNS** through your Cloudflare account (OAuth-authorized, no API token pasting), with safe conflict handling and rollback on unbind.
 - **Automatic certificates** from Let's Encrypt — including a short-lived IP certificate so even the admin UI at `https://<your-ip>:9443` is served over trusted TLS.
-- **A browser admin UI** rendered entirely from the binary: no CDN, no Node.js, no frontend build.
+- **A browser admin UI** rendered entirely from the binary — light and dark, desktop and phone — with no CDN, no Node.js, and no frontend build.
 
 Everything persists in one SQLite database with encrypted credentials, survives restarts, and installs as a hardened systemd service.
+
+## Screenshots
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/dashboard-dark.png">
+  <img src="assets/screenshots/dashboard-light.png" alt="HostKnot dashboard listing four domain bindings with their upstreams, status, certificates, and DNS mode">
+</picture>
+
+<table>
+  <tr>
+    <td width="33%"><img src="assets/screenshots/new-binding.png" alt="Binding a new domain to a local port"></td>
+    <td width="33%"><img src="assets/screenshots/binding.png" alt="Editing a binding's default upstream and path routes"></td>
+    <td width="33%"><img src="assets/screenshots/cloudflare.png" alt="Guided Cloudflare OAuth setup"></td>
+  </tr>
+  <tr>
+    <td align="center">Bind a domain</td>
+    <td align="center">Upstream and path routes</td>
+    <td align="center">Guided Cloudflare setup</td>
+  </tr>
+</table>
 
 ## How it works
 
@@ -48,13 +72,15 @@ curl -4 ifconfig.me
 systemctl daemon-reload && systemctl enable --now hostknot
 ```
 
-**2. Open the setup link.** The service log prints a one-time setup URL:
+The installer prints these next steps along with the everyday commands. Run `hostknot` with no arguments any time to see them again.
+
+**2. Open the setup link.** Ask HostKnot for the admin URL:
 
 ```sh
-journalctl -u hostknot | grep 'setup URL'
+hostknot admin url
 ```
 
-It looks like `https://<YOUR_VPS_IP>:9443/setup?token=...`. The token is single-use and expires after one hour — restart the service or run `hostknot admin reset` for a fresh one. Before the URL appears, HostKnot obtains a trusted Let's Encrypt IP certificate over HTTP-01, so port 80 must already be reachable; if issuance fails, the UI still comes up on a self-signed fallback and keeps retrying.
+Before first setup it prints a one-time link like `https://<YOUR_VPS_IP>:9443/setup?token=...`, valid for one hour; run it again any time for a fresh one (earlier links stop working). Once an administrator exists, it prints the sign-in URL instead. The service log also prints a setup link at startup. Before the admin UI is served, HostKnot obtains a trusted Let's Encrypt IP certificate over HTTP-01, so port 80 must already be reachable; if issuance fails, the UI still comes up on a self-signed fallback and keeps retrying.
 
 **3. Create the administrator.** Open the URL, set an admin password (12+ characters) and an ACME contact email.
 
@@ -86,13 +112,16 @@ It looks like `https://<YOUR_VPS_IP>:9443/setup?token=...`. The token is single-
 
 | Command | Purpose |
 |---|---|
+| `hostknot` | Show service status, the admin panel URL, and the commands you'll need — start here if you've forgotten |
 | `hostknot serve [--config <PATH>]` | Run the admin UI and proxy listeners (what the systemd unit runs) |
 | `hostknot doctor [--config <PATH>] [--offline]` | Check IPs, ports, key permissions, database integrity, and outbound Cloudflare/ACME connectivity; exits non-zero if problems are found |
 | `hostknot service install --public-ip <IP> [--binary <PATH>] [--root <PATH>]` | Install/upgrade the binary, default config, and hardened systemd unit |
-| `hostknot admin reset [--state-dir <PATH>]` | Invalidate all sessions and print a new one-time setup token (bindings, credentials, and certificates are kept) |
+| `hostknot admin url [--config <PATH>]` | Print the admin panel URL; before first setup, issue a fresh one-time setup link |
+| `hostknot admin reset [--config <PATH>] [--state-dir <PATH>]` | Invalidate the password and all sessions, then print a one-time setup link (bindings, credentials, and certificates are kept) |
+| `hostknot logs [-f] [-n <N>] [--since <WHEN>]` | Show the service log from the systemd journal, formatted for reading |
 | `hostknot version` | Print the version |
 
-Defaults: `--config /etc/hostknot/config.toml`, `--state-dir /var/lib/hostknot`.
+Defaults: `--config /etc/hostknot/config.toml`; `admin reset` takes the state directory from the config, falling back to `/var/lib/hostknot`.
 
 ## Configuration
 
@@ -143,7 +172,7 @@ Start with the built-in diagnostics — it checks the same things that make inst
 hostknot doctor --config /etc/hostknot/config.toml
 ```
 
-The admin dashboard shows per-binding DNS/certificate/upstream status and an event history. [docs/operations.md](docs/operations.md) covers failure behavior, backup/restore, and upgrades.
+The admin dashboard shows per-binding DNS/certificate/upstream status and an event history. For the service log, run `hostknot logs` (add `-f` to follow, or `--since "1 hour ago"`). [docs/operations.md](docs/operations.md) covers failure behavior, backup/restore, and upgrades.
 
 Common gotchas:
 
@@ -169,6 +198,8 @@ Browser tests (Playwright, drives a real HostKnot process through setup, OAuth, 
 npm ci && npx playwright install chromium
 npm run test:browser
 ```
+
+Regenerate the README screenshots (same fixture, real proxied traffic) with `npm run screenshots`.
 
 ACME issuance and renewal against a local [Pebble](https://github.com/letsencrypt/pebble) server:
 

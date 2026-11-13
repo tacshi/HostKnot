@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "pretest:browser": "cargo build --quiet --example browser_fixture",
-    "test:browser": "playwright test"
+    "test:browser": "playwright test",
+    "screenshots": "cargo build --quiet --example browser_fixture && node scripts/screenshots.mjs"
   },
   "devDependencies": {
     "@playwright/test": "1.62.1"

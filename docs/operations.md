@@ -2,7 +2,7 @@
 
 ## Before installation
 
-Point the configured public IP at this VPS, permit inbound TCP 80/443/9443, and make sure no other process owns those ports. Run `hostknot doctor --config /etc/hostknot/config.toml` after installation. Its checks cover configuration, master-key permissions, SQLite integrity, listener availability, and outbound Cloudflare/ACME connectivity.
+Point the configured public IP at this VPS, permit inbound TCP 80/443/9443, and make sure no other process owns those ports. Run `hostknot doctor --config /etc/hostknot/config.toml` after installation. Running `hostknot` with no arguments later shows the service state, the admin URL, and the everyday commands; `hostknot logs -f` follows the service log. Its checks cover configuration, master-key permissions, SQLite integrity, listener availability, and outbound Cloudflare/ACME connectivity.
 
 ## Backup
 
@@ -41,6 +41,7 @@ Schema migrations are transactional and forward-only. Do not start an older Host
 - **DNS drift during edit/unbind:** the binding remains in a retryable update or removal state, and HostKnot leaves externally changed records untouched.
 - **Default upstream unavailable:** clients receive a minimal 502 and the binding becomes degraded. A successful request returns it to active/healthy.
 - **Path-route upstream unavailable:** matching clients receive a minimal 502 and only that route becomes unavailable. HostKnot never retries the request against the default upstream.
+- **Lost setup link:** run `hostknot admin url` for a fresh one-time link (it also prints the sign-in URL once setup is done).
 - **Lost admin password:** run `hostknot admin reset`; existing routes remain online.
 
 ## Security notes

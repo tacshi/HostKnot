@@ -23,7 +23,10 @@ fn systemd_install_is_hardened_idempotent_and_doctor_can_validate_it() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("installed"));
+        .stdout(predicate::str::contains("installed"))
+        .stdout(predicate::str::contains("sudo hostknot admin url"))
+        .stdout(predicate::str::contains("https://203.0.113.10:9443/"))
+        .stdout(predicate::str::contains("Run `hostknot` to see them again"));
 
     let unit = fs::read_to_string(root.path().join("etc/systemd/system/hostknot.service"))
         .expect("systemd unit");
@@ -53,7 +56,9 @@ fn systemd_install_is_hardened_idempotent_and_doctor_can_validate_it() {
             "203.0.113.10",
         ])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("upgraded"))
+        .stdout(predicate::str::contains("systemctl restart hostknot"));
     assert_eq!(fs::read_to_string(&config_path).unwrap(), original_config);
 
     let mut doctor = Command::cargo_bin("hostknot").unwrap();
@@ -96,4 +101,62 @@ fn systemd_install_is_hardened_idempotent_and_doctor_can_validate_it() {
         .stdout(predicate::str::contains("[fail] master key permissions"))
         .stdout(predicate::str::contains("not ready"))
         .stdout(predicate::str::contains("listener"));
+}
+
+#[test]
+fn admin_url_prints_a_fresh_setup_link_from_the_config() {
+    let root = TempDir::new().unwrap();
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"state_dir = "{}"
+admin_listen = "127.0.0.1:9443"
+http_listen = "127.0.0.1:80"
+https_listen = "127.0.0.1:443"
+public_ips = ["203.0.113.10"]
+admin_public_url = "https://203.0.113.10:9443/"
+"#,
+            root.path().join("state").display()
+        ),
+    )
+    .unwrap();
+
+    let link = |output: &[u8]| {
+        String::from_utf8_lossy(output)
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("https://203.0.113.10:9443/setup?token=")
+                    .map(str::to_owned)
+            })
+            .expect("setup link in output")
+    };
+    let first = Command::cargo_bin("hostknot")
+        .unwrap()
+        .args(["admin", "url", "--config", config_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("expires in 1 hour"))
+        .get_output()
+        .stdout
+        .clone();
+    let second = Command::cargo_bin("hostknot")
+        .unwrap()
+        .args(["admin", "url", "--config", config_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_ne!(link(&first), link(&second));
+
+    Command::cargo_bin("hostknot")
+        .unwrap()
+        .args(["admin", "reset", "--config", config_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "https://203.0.113.10:9443/setup?token=",
+        ));
 }
