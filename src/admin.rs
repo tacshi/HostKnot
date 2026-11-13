@@ -18,8 +18,9 @@ use axum::{
 use serde::Deserialize;
 
 use self::security::{
-    PeerIp, attach_peer_ip, authenticated_csrf, cookie, login_is_throttled, record_login_failure,
-    require_csrf, security_headers, session_redirect,
+    LoginAttempt, PeerIp, attach_peer_ip, authenticated_csrf, begin_login_attempt,
+    clear_login_attempts, cookie, require_csrf, security_headers, session_cookie,
+    session_cookie_name, session_redirect,
 };
 use self::views::{
     FAVICON_SVG, HtmlStatus, ICON_ALERT, ICON_CHECK, ICON_LOCK, Nav, app_page, auth_page,
@@ -42,6 +43,7 @@ pub struct AdminState {
     bindings: BindingManager,
     expected_origin: String,
     failed_logins: Mutex<HashMap<IpAddr, VecDeque<i64>>>,
+    session_cookie: &'static str,
     certificates: Arc<CertificateResolver>,
     clock: crate::Clock,
 }
@@ -66,6 +68,7 @@ impl AdminState {
             bindings,
             expected_origin,
             failed_logins: Mutex::new(HashMap::new()),
+            session_cookie: session_cookie_name(secure_cookies),
             certificates,
             clock,
         })
@@ -124,7 +127,7 @@ async fn index(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Resp
     if !state.store.is_configured().unwrap_or(false) {
         return Redirect::to("/setup").into_response();
     }
-    let Some(csrf) = authenticated_csrf(&state.store, &headers) else {
+    let Some(csrf) = authenticated_csrf(&state, &headers) else {
         return Redirect::to("/login").into_response();
     };
     let bindings = state.bindings.list().unwrap_or_default();
@@ -241,15 +244,24 @@ struct SetupForm {
 }
 
 async fn setup(State(state): State<Arc<AdminState>>, Form(form): Form<SetupForm>) -> Response {
-    match state
-        .store
-        .complete_setup(&form.token, &form.password, &form.acme_email)
-    {
+    // Argon2 hashing is deliberately slow; keep it off the async workers
+    // that also serve proxy traffic.
+    let store = state.store.clone();
+    let (token, password, acme_email) = (
+        form.token.clone(),
+        form.password.clone(),
+        form.acme_email.clone(),
+    );
+    let completed =
+        tokio::task::spawn_blocking(move || store.complete_setup(&token, &password, &acme_email))
+            .await
+            .unwrap_or_else(|error| Err(anyhow::anyhow!("setup task failed: {error}")));
+    match completed {
         Ok(session) => {
             if let Err(error) = state.certificates.update_contact(&form.acme_email).await {
                 tracing::warn!(%error, "failed to update ACME contact; renewal will retry without blocking setup");
             }
-            session_redirect(&session, state.secure_cookies, "/")
+            session_redirect(&state, &session, "/")
         }
         // With a still-valid token the input itself was rejected; show why
         // and let the operator correct it.
@@ -278,30 +290,43 @@ async fn login(
     Extension(PeerIp(peer_ip)): Extension<PeerIp>,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    // Throttling is keyed per client IP so an attacker cannot lock the real
-    // operator out of the only management surface.
-    if login_is_throttled(&state, peer_ip) {
-        let mut response = Html(login_form(Some(
-            "Too many failed attempts from this address. Wait five minutes and try again.",
-        )))
-        .into_response_with_status(StatusCode::TOO_MANY_REQUESTS);
-        response
-            .headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("300"));
-        return response;
-    }
-    if !state.store.verify_password(&form.password).unwrap_or(false) {
-        record_login_failure(&state, peer_ip);
-        let _ = state.store.record_event(
-            "security",
-            &format!("Failed administrator login from {peer_ip}"),
-        );
+    // Throttling is keyed per client address so an attacker cannot lock the
+    // real operator out of the only management surface.
+    let first_attempt = match begin_login_attempt(&state, peer_ip) {
+        LoginAttempt::Throttled => {
+            let mut response = Html(login_form(Some(
+                "Too many failed attempts from this address. Wait five minutes and try again.",
+            )))
+            .into_response_with_status(StatusCode::TOO_MANY_REQUESTS);
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("300"));
+            return response;
+        }
+        LoginAttempt::Allowed { first } => first,
+    };
+    // Argon2 verification is deliberately slow; keep it off the async
+    // workers that also serve proxy traffic.
+    let store = state.store.clone();
+    let password = form.password;
+    let verified = tokio::task::spawn_blocking(move || store.verify_password(&password))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false);
+    if !verified {
+        if first_attempt {
+            let _ = state.store.record_event(
+                "security",
+                &format!("Failed administrator login from {peer_ip}"),
+            );
+        }
         return Html(login_form(Some("That password is incorrect.")))
             .into_response_with_status(StatusCode::UNAUTHORIZED);
     }
-    state.failed_logins.lock().unwrap().remove(&peer_ip);
+    clear_login_attempts(&state, peer_ip);
     match state.store.create_session() {
-        Ok(session) => session_redirect(&session, state.secure_cookies, "/"),
+        Ok(session) => session_redirect(&state, &session, "/"),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -314,19 +339,18 @@ async fn logout(
     if let Some(rejection) = require_csrf(&state, &headers, &form.csrf) {
         return rejection;
     }
-    if let Some(session) = cookie(&headers, "hostknot_session") {
+    if let Some(session) = cookie(&headers, state.session_cookie) {
         let _ = state.store.destroy_session(session);
     }
     let mut response = Redirect::to("/login").into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_static("hostknot_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
-    );
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, session_cookie(&state, "", 0));
     response
 }
 
 async fn cloudflare_page(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Response {
-    let Some(csrf) = authenticated_csrf(&state.store, &headers) else {
+    let Some(csrf) = authenticated_csrf(&state, &headers) else {
         return Redirect::to("/login").into_response();
     };
     let configured = state.cloudflare.configured();
@@ -351,8 +375,8 @@ async fn cloudflare_page(State(state): State<Arc<AdminState>>, headers: HeaderMa
         String::new()
     } else if configured {
         format!(
-            r#"<section class="card step"><div class="step-head"><span class="step-num">3</span><div><span class="step-label">In Cloudflare</span><h2>Authorize Cloudflare</h2></div></div><p>Open Cloudflare, review the requested DNS permissions, and approve access.</p><div class="step-actions"><a class="button" href="/providers/cloudflare/connect">Authorize with Cloudflare</a></div></section><details class="reconfigure"><summary>Change OAuth client credentials</summary><form class="card" method="post" action="/providers/cloudflare/configure"><input type="hidden" name="csrf" value="{}"><div class="form-title"><h2>Replace saved credentials</h2></div>{credentials_fields}<div class="form-actions"><button type="submit">Save OAuth client</button></div></form></details>"#,
-            escape_html(&csrf)
+            r#"<section class="card step"><div class="step-head"><span class="step-num">3</span><div><span class="step-label">In Cloudflare</span><h2>Authorize Cloudflare</h2></div></div><p>Open Cloudflare, review the requested DNS permissions, and approve access.</p><div class="step-actions"><a class="button" href="/providers/cloudflare/connect?csrf={csrf}">Authorize with Cloudflare</a></div></section><details class="reconfigure"><summary>Change OAuth client credentials</summary><form class="card" method="post" action="/providers/cloudflare/configure"><input type="hidden" name="csrf" value="{csrf}"><div class="form-title"><h2>Replace saved credentials</h2></div>{credentials_fields}<div class="form-actions"><button type="submit">Save OAuth client</button></div></form></details>"#,
+            csrf = escape_html(&csrf)
         )
     } else {
         format!(
@@ -435,8 +459,23 @@ async fn configure_cloudflare(
     }
 }
 
-async fn connect_cloudflare(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Response {
-    let Some(session) = cookie(&headers, "hostknot_session") else {
+#[derive(Deserialize)]
+struct ConnectQuery {
+    #[serde(default)]
+    csrf: String,
+}
+
+async fn connect_cloudflare(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+    Query(query): Query<ConnectQuery>,
+) -> Response {
+    // Starting authorization can end with a different Cloudflare account's
+    // tokens stored, so a cross-site link must not be able to trigger it.
+    if let Some(rejection) = require_csrf(&state, &headers, &query.csrf) {
+        return rejection;
+    }
+    let Some(session) = cookie(&headers, state.session_cookie) else {
         return Redirect::to("/login").into_response();
     };
     if !state.store.session_valid(session).unwrap_or(false) {
@@ -456,21 +495,21 @@ async fn start_cloudflare_connect(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(session) = cookie(&headers, "hostknot_session") else {
+    let Some(csrf) = authenticated_csrf(&state, &headers) else {
         return Redirect::to("/login").into_response();
     };
-    if !state.store.session_valid(session).unwrap_or(false) {
-        return Redirect::to("/login").into_response();
-    }
+    let connect = format!("/providers/cloudflare/connect?csrf={}", escape_html(&csrf));
     Html(page_with_head(
         "Continue to Cloudflare",
-        r#"<meta http-equiv="refresh" content="0;url=/providers/cloudflare/connect">"#,
+        &format!(r#"<meta http-equiv="refresh" content="0;url={connect}">"#),
         &views::bare(&notice(
             "info",
             "DNS provider",
             "Opening Cloudflare",
             "If authorization does not open automatically, continue below.",
-            r#"<div class="notice-actions"><a class="button" href="/providers/cloudflare/connect">Authorize with Cloudflare</a></div>"#,
+            &format!(
+                r#"<div class="notice-actions"><a class="button" href="{connect}">Authorize with Cloudflare</a></div>"#
+            ),
         )),
     ))
     .into_response()
@@ -490,7 +529,7 @@ async fn cloudflare_callback(
 ) -> Response {
     // The stored OAuth attempt is bound to the admin session that started the
     // flow; a leaked state value alone is useless to anyone else.
-    let Some(session) = cookie(&headers, "hostknot_session") else {
+    let Some(session) = cookie(&headers, state.session_cookie) else {
         return Redirect::to("/login").into_response();
     };
     if !state.store.session_valid(session).unwrap_or(false) {
@@ -546,7 +585,7 @@ async fn cloudflare_callback(
 }
 
 async fn new_binding_page(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Response {
-    let Some(csrf) = authenticated_csrf(&state.store, &headers) else {
+    let Some(csrf) = authenticated_csrf(&state, &headers) else {
         return Redirect::to("/login").into_response();
     };
     let ports = discover_listening_ports()
@@ -640,7 +679,7 @@ async fn edit_binding_page(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(csrf) = authenticated_csrf(&state.store, &headers) else {
+    let Some(csrf) = authenticated_csrf(&state, &headers) else {
         return Redirect::to("/login").into_response();
     };
     let Some(binding) = state.store.binding(&id).ok().flatten() else {
@@ -743,7 +782,7 @@ async fn edit_path_route_page(
     Path((binding_id, route_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(csrf) = authenticated_csrf(&state.store, &headers) else {
+    let Some(csrf) = authenticated_csrf(&state, &headers) else {
         return Redirect::to("/login").into_response();
     };
     let Some(binding) = state.store.binding(&binding_id).ok().flatten() else {

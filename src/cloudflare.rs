@@ -165,6 +165,27 @@ impl Cloudflare {
                  when the access token expires. Ensure offline_access is granted."
             );
         }
+        // Existing bindings' records live in specific zones. Connecting an
+        // account that cannot reach them would strand those records: unbind
+        // could never remove them or restore what they replaced.
+        let required = self.store.provider_zone_ids()?;
+        if !required.is_empty() {
+            let reachable = self
+                .zones(&token.access_token)
+                .await
+                .context("list zones for the newly authorized account")?;
+            let missing = required
+                .iter()
+                .filter(|zone| !reachable.iter().any(|candidate| &candidate.id == *zone))
+                .count();
+            if missing > 0 {
+                bail!(
+                    "this Cloudflare account cannot manage {missing} zone(s) used by existing \
+                     bindings. Authorize the account that owns them, or remove those bindings \
+                     first."
+                );
+            }
+        }
         self.store.save_cloudflare_tokens(
             &token.access_token,
             token.refresh_token.as_deref(),
@@ -257,12 +278,18 @@ impl Cloudflare {
         }
         let token: TokenResponse =
             serde_json::from_str(&body).context("decode Cloudflare refresh response")?;
-        self.store.save_cloudflare_tokens(
+        let stored = self.store.replace_refreshed_cloudflare_tokens(
+            refresh_token,
             &token.access_token,
-            token.refresh_token.as_deref().or(Some(refresh_token)),
+            token.refresh_token.as_deref().unwrap_or(refresh_token),
             token.expires_in,
             token.scope.as_deref().unwrap_or(&current.scopes),
         )?;
+        if !stored {
+            // The operator disconnected or connected another account while
+            // this refresh was in flight; the newer state stands.
+            return Err(DnsError::AuthorizationRequired.into());
+        }
         self.store
             .record_event("provider", "Cloudflare access token refreshed")?;
         Ok(token.access_token)

@@ -63,8 +63,9 @@ async fn run_proxy_scenario(scenario: ProxyScenario) {
             "/hello",
             any(|headers: HeaderMap| async move {
                 format!(
-                    "host={};proto={};for={};secret={}",
+                    "host={};hosts={};proto={};for={};secret={}",
                     headers["host"].to_str().unwrap(),
+                    headers.get_all("host").iter().count(),
                     headers["x-forwarded-proto"].to_str().unwrap(),
                     headers["x-forwarded-for"].to_str().unwrap(),
                     headers
@@ -817,6 +818,41 @@ async fn assert_forwarding_and_streaming(running: &RunningHostKnot, proxy: &Clie
     assert!(!body.contains("6.6.6.6"));
     assert!(body.contains("secret=absent"));
 
+    // Non-origin-form targets must not be spliced into the upstream URI,
+    // where `*` would drop the port and loop back into HostKnot itself.
+    let asterisk = raw_https(
+        running.https_addr(),
+        "OPTIONS * HTTP/1.1\r\nHost: app.example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(asterisk.starts_with("HTTP/1.1 400"), "{asterisk}");
+    // The upstream sees exactly one Host: the one HostKnot routed on.
+    let duplicated = raw_https(
+        running.https_addr(),
+        "GET /hello HTTP/1.1\r\nHost: app.example.com\r\nHost: other.example.com\r\n\
+         Connection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        duplicated.contains("host=app.example.com;hosts=1"),
+        "{duplicated}"
+    );
+    // Dot segments resolve before routing, exactly as the upstream would.
+    let dotted = raw_https(
+        running.https_addr(),
+        "GET /nowhere/../hello HTTP/1.1\r\nHost: app.example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(dotted.starts_with("HTTP/1.1 200"), "{dotted}");
+    // Hostnames that cannot be DNS names are refused before any lookup.
+    let oversized = proxy
+        .get(format!("https://{}/hello", running.https_addr()))
+        .header("host", "a".repeat(300))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+
     let streaming = proxy
         .get(format!("https://{}/events", running.https_addr()))
         .header("host", "app.example.com")
@@ -1026,6 +1062,24 @@ async fn peer_certificate(address: std::net::SocketAddr, server_name: &str) -> V
         .to_vec()
 }
 
+/// Sends raw bytes over TLS: some request shapes cannot be built with
+/// reqwest at all.
+async fn raw_https(address: std::net::SocketAddr, request: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let connector = tokio_rustls::TlsConnector::from(insecure_tls_client());
+    let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("app.example.com").unwrap();
+    let mut stream = connector.connect(name, socket).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_to_end(&mut response),
+    )
+    .await;
+    String::from_utf8_lossy(&response).into_owned()
+}
+
 async fn create_binding(browser: &Client, base: &str, hostname: &str, scheme: &str, port: u16) {
     let page = browser
         .get(format!("{base}/bindings/new"))
@@ -1213,7 +1267,7 @@ async fn initialize_and_connect(client: &Client, base: &str, bootstrap: String) 
         .await
         .unwrap();
     let connect = client
-        .get(format!("{base}/providers/cloudflare/connect"))
+        .get(format!("{base}/providers/cloudflare/connect?csrf={csrf}"))
         .send()
         .await
         .unwrap();

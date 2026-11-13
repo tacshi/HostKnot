@@ -116,6 +116,9 @@ async fn http_entry(State(state): State<Arc<ProxyState>>, request: Request<Body>
     let Some(hostname) = request_hostname(&request) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if !request.uri().path().starts_with('/') {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     if !state.store.hostname_is_routable(&hostname).unwrap_or(false) {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -136,7 +139,15 @@ async fn proxy_entry(
     let Some(hostname) = request_hostname(&request) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let request_path = request.uri().path().to_owned();
+    // `OPTIONS *` and other non-origin-form targets have no path to forward;
+    // spliced into an upstream URI they would drop the port and loop back
+    // into HostKnot's own listener.
+    if !request.uri().path().starts_with('/') {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    // Route and forward the same resolved path, so an upstream never sees a
+    // path that would have routed elsewhere.
+    let request_path = crate::store::routing_path(request.uri().path());
     let Some(route) = state
         .store
         .active_proxy_route(&hostname, &request_path)
@@ -145,14 +156,14 @@ async fn proxy_entry(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    // h2 requests carry no Host header; materialize one from :authority so the
-    // HTTP/1.1 upstream hop sees the original host instead of the loopback URI.
-    if !request.headers().contains_key(header::HOST)
-        && let Some(authority) = request.uri().authority()
-        && let Ok(value) = HeaderValue::from_str(authority.as_str())
-    {
-        request.headers_mut().insert(header::HOST, value);
-    }
+    // Exactly one Host, the one routing used: h2 requests carry none (only
+    // :authority), and duplicate Host headers would let an upstream that
+    // reads the last copy pick a different virtual host.
+    request.headers_mut().remove(header::HOST);
+    request.headers_mut().insert(
+        header::HOST,
+        HeaderValue::from_str(&hostname).expect("validated hostname is a valid header value"),
+    );
     let websocket = is_websocket_upgrade(request.headers());
     let downstream_upgrade = websocket.then(|| hyper::upgrade::on(&mut request));
     // For Cloudflare-proxied bindings the TCP peer is a Cloudflare edge, and
@@ -172,16 +183,15 @@ async fn proxy_entry(
         "https",
         websocket,
     );
-    let path = request
-        .uri()
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or("/");
-    let upstream_uri: Uri = match format!(
-        "{}://{}:{}{}",
-        route.upstream_scheme, route.hostname, route.upstream_port, path
-    )
-    .parse()
+    let path = match request.uri().query() {
+        Some(query) => format!("{request_path}?{query}"),
+        None => request_path.clone(),
+    };
+    let upstream_uri = match Uri::builder()
+        .scheme(route.upstream_scheme.as_str())
+        .authority(format!("{}:{}", route.hostname, route.upstream_port))
+        .path_and_query(path)
+        .build()
     {
         Ok(uri) => uri,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
@@ -331,7 +341,15 @@ fn request_hostname(request: &Request<Body>) -> Option<String> {
     } else {
         raw.split(':').next()?
     };
-    Some(host.trim_end_matches('.').to_ascii_lowercase())
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    // Bindings are DNS names, so anything else can be refused before it
+    // reaches the store or the routing cache.
+    let valid = !host.is_empty()
+        && host.len() <= 253
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.');
+    valid.then_some(host)
 }
 
 fn prepare_forward_headers(
@@ -390,7 +408,7 @@ const CLOUDFLARE_RANGES: &[&str] = &[
     "2c0f:f248::/32",
 ];
 
-fn is_cloudflare_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_cloudflare_ip(ip: IpAddr) -> bool {
     CLOUDFLARE_RANGES.iter().any(|range| {
         let Some((network, prefix)) = range.split_once('/') else {
             return false;

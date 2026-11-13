@@ -1,7 +1,7 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::IpAddr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -27,7 +27,13 @@ pub struct BindingManager {
     /// Wakes the reconciliation loop early after a failure lands a binding in
     /// a retryable state, instead of waiting out the idle interval.
     reconcile_nudge: Arc<tokio::sync::Notify>,
+    /// One lock per binding: request handlers, the reconciliation loop, and
+    /// drain timers all mutate the same DNS records, so their steps must
+    /// never interleave.
+    locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
+
+type BindingGuard = tokio::sync::OwnedMutexGuard<()>;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct CreateBinding {
@@ -79,6 +85,7 @@ impl BindingManager {
             reserved_ports: reserved_ports.into_iter().collect(),
             drain_duration,
             reconcile_nudge: Arc::new(tokio::sync::Notify::new()),
+            locks: Arc::new(Mutex::new(HashMap::new())),
         };
         if let Err(error) = manager.resume_drains() {
             tracing::error!(%error, "failed to resume binding drains");
@@ -93,6 +100,9 @@ impl BindingManager {
             bail!("at least one public IP address is required");
         }
         let binding_id = Uuid::now_v7().to_string();
+        // Held from before the row exists: reconciliation must not pick up
+        // the new pending binding while this request is applying its plan.
+        let _guard = self.lock(&binding_id).await;
         let binding = self.store.create_binding(
             &binding_id,
             &hostname,
@@ -106,6 +116,7 @@ impl BindingManager {
             Err(error) => {
                 if crate::provider::is_conflict(&error) {
                     self.store.delete_binding(&binding_id)?;
+                    self.forget_lock(&binding_id);
                     return Err(error);
                 }
                 self.store.mark_binding_error(
@@ -148,6 +159,7 @@ impl BindingManager {
     }
 
     pub async fn remove(&self, id: &str) -> Result<()> {
+        let _guard = self.lock(id).await;
         let binding = self.store.binding(id)?.context("binding does not exist")?;
         // Removal already ran and the route is draining; a second click must
         // be a harmless no-op, not a second revert that misreads its own
@@ -174,6 +186,7 @@ impl BindingManager {
 
     pub async fn update(&self, id: &str, input: UpdateBinding) -> Result<()> {
         self.validate_local_upstream(&input.upstream_scheme, input.upstream_port)?;
+        let _guard = self.lock(id).await;
         let binding = self.store.binding(id)?.context("binding does not exist")?;
         if !binding.status.is_editable() {
             bail!("only active bindings can be edited");
@@ -342,7 +355,17 @@ impl BindingManager {
 
     pub async fn reconcile_once(&self) -> Result<bool> {
         let mut pending = false;
-        for binding in self.store.list_bindings()? {
+        for listed in self.store.list_bindings()? {
+            // A binding a request is working on right now is left for the
+            // next pass rather than raced.
+            let Some(_guard) = self.try_lock(&listed.id) else {
+                pending = true;
+                continue;
+            };
+            // Re-read under the lock: the listing may already be stale.
+            let Some(binding) = self.store.binding(&listed.id)? else {
+                continue;
+            };
             match binding.status {
                 BindingStatus::DnsPending => {
                     pending = true;
@@ -483,16 +506,43 @@ impl BindingManager {
     }
 
     fn schedule_drain(&self, id: String, hostname: String, delay: Duration) {
-        let store = self.store.clone();
-        let certificates = self.certificates.clone();
+        let manager = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            if let Err(error) = store.delete_binding(&id) {
-                tracing::error!(%error, binding_id = id, "failed to finish binding drain");
-                return;
+            let _guard = manager.lock(&id).await;
+            match manager.store.delete_drained_binding(&id) {
+                Ok(true) => {
+                    manager.certificates.remove(&hostname);
+                    manager.forget_lock(&id);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(%error, binding_id = id, "failed to finish binding drain");
+                }
             }
-            certificates.remove(&hostname);
         });
+    }
+
+    fn binding_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .unwrap()
+            .entry(id.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    async fn lock(&self, id: &str) -> BindingGuard {
+        self.binding_lock(id).lock_owned().await
+    }
+
+    fn try_lock(&self, id: &str) -> Option<BindingGuard> {
+        self.binding_lock(id).try_lock_owned().ok()
+    }
+
+    /// Called once the binding row is gone, while still holding its lock.
+    fn forget_lock(&self, id: &str) {
+        self.locks.lock().unwrap().remove(id);
     }
 }
 
@@ -577,6 +627,114 @@ mod tests {
         )
     }
 
+    /// Wraps the in-memory provider, pausing the first `apply` until released
+    /// and logging the order of provider calls.
+    struct GatedProvider {
+        inner: InMemoryDnsProvider,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        gated: std::sync::atomic::AtomicBool,
+        log: Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DnsProvider for GatedProvider {
+        async fn prepare(&self, intent: &DnsIntent) -> Result<crate::provider::DnsPlan> {
+            self.inner.prepare(intent).await
+        }
+        async fn apply(
+            &self,
+            plan: &crate::provider::DnsPlan,
+        ) -> Result<crate::provider::DnsReceipt> {
+            self.log.lock().unwrap().push("apply-start");
+            if self.gated.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            let receipt = self.inner.apply(plan).await;
+            self.log.lock().unwrap().push("apply-end");
+            receipt
+        }
+        async fn set_proxy_mode(
+            &self,
+            receipt: &crate::provider::DnsReceipt,
+            proxied: bool,
+        ) -> Result<crate::provider::DnsReceipt> {
+            self.inner.set_proxy_mode(receipt, proxied).await
+        }
+        async fn revert(&self, receipt: &crate::provider::DnsReceipt) -> Result<()> {
+            self.log.lock().unwrap().push("revert");
+            self.inner.revert(receipt).await
+        }
+    }
+
+    #[tokio::test]
+    async fn removal_waits_for_an_in_flight_reconcile_instead_of_racing_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let provider = Arc::new(GatedProvider {
+            inner: InMemoryDnsProvider::new(Vec::new()),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            gated: std::sync::atomic::AtomicBool::new(true),
+            log: Mutex::new(Vec::new()),
+        });
+        let manager = manager_with_provider(&store, Duration::from_secs(300), provider.clone());
+        // A create that failed transiently leaves the binding for reconciliation.
+        store
+            .create_binding("b1", "app.example.com", "http", 8080, false, false)
+            .unwrap();
+
+        let reconciling = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.reconcile_once().await }
+        });
+        provider.entered.notified().await;
+        let removing = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.remove("b1").await }
+        });
+        // While reconciliation is mid-apply, removal must not touch DNS.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(*provider.log.lock().unwrap(), ["apply-start"]);
+
+        provider.release.notify_one();
+        reconciling.await.unwrap().unwrap();
+        removing.await.unwrap().unwrap();
+        assert_eq!(
+            *provider.log.lock().unwrap(),
+            ["apply-start", "apply-end", "revert"]
+        );
+        let binding = store.binding("b1").unwrap().unwrap();
+        assert_eq!(binding.status, BindingStatus::Draining);
+        assert!(provider.inner.records().is_empty());
+    }
+
+    #[test]
+    fn stale_steps_cannot_overwrite_a_newer_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .create_binding("b1", "app.example.com", "http", 8080, false, false)
+            .unwrap();
+        store.set_binding_status_for_test("b1", BindingStatus::Draining);
+        // A late error from an older DnsPending step is dropped, not applied.
+        store
+            .mark_binding_error("b1", BindingStatus::DnsPending, "late failure")
+            .unwrap();
+        let binding = store.binding("b1").unwrap().unwrap();
+        assert_eq!(binding.status, BindingStatus::Draining);
+        assert_eq!(binding.last_error, None);
+        // Lifecycle steps from the wrong state fail instead of applying.
+        assert!(store.mark_binding_active("b1").is_err());
+        assert!(store.begin_binding_removal("b1").is_err());
+        assert!(store.delete_binding("b1").is_err());
+        assert_eq!(
+            store.binding("b1").unwrap().unwrap().status,
+            BindingStatus::Draining
+        );
+    }
+
     async fn assert_deleted_soon(store: &Store, id: &str, message: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while store.binding(id).unwrap().is_some() {
@@ -592,6 +750,7 @@ mod tests {
         store
             .create_binding("b1", "app.example.com", "http", 8080, false, false)
             .unwrap();
+        store.set_binding_status_for_test("b1", BindingStatus::Removing);
         store.mark_binding_draining("b1", Duration::ZERO).unwrap();
         // Let the stored drain deadline fall into the past before "restarting".
         tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -780,7 +939,7 @@ mod tests {
         store
             .create_binding("b1", "app.example.com", "https", port, false, false)
             .unwrap();
-        store.mark_binding_active("b1").unwrap();
+        store.set_binding_status_for_test("b1", BindingStatus::Active);
         store
             .update_binding_health("b1", false, Some("HTTPS upstream connection failed"))
             .unwrap();

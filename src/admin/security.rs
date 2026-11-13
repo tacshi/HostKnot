@@ -8,7 +8,6 @@ use axum::{
 };
 
 use super::{AdminState, views::error_page};
-use crate::store::Store;
 
 /// The TLS accept loop attaches the peer as `Extension<SocketAddr>`, while the
 /// plain-HTTP admin listener provides `ConnectInfo`; handlers consume this
@@ -41,9 +40,19 @@ pub(super) async fn attach_peer_ip(mut request: Request, next: Next) -> Response
     next.run(request).await
 }
 
-pub(super) fn authenticated_csrf(store: &Store, headers: &HeaderMap) -> Option<String> {
-    let session = cookie(headers, "hostknot_session")?;
-    store.session_csrf(session).ok().flatten()
+pub(super) fn authenticated_csrf(state: &AdminState, headers: &HeaderMap) -> Option<String> {
+    let session = cookie(headers, state.session_cookie)?;
+    state.store.session_csrf(session).ok().flatten()
+}
+
+/// Under HTTPS the `__Host-` prefix pins the cookie to this exact origin:
+/// no other service on the same IP (any port) can set or shadow it.
+pub(super) fn session_cookie_name(secure: bool) -> &'static str {
+    if secure {
+        "__Host-hostknot_session"
+    } else {
+        "hostknot_session"
+    }
 }
 
 /// Guards a mutating request. Returns the failure response to send, or `None`
@@ -55,7 +64,7 @@ pub(super) fn require_csrf(
     supplied: &str,
 ) -> Option<Response> {
     use subtle::ConstantTimeEq;
-    let Some(expected) = authenticated_csrf(&state.store, headers) else {
+    let Some(expected) = authenticated_csrf(state, headers) else {
         return Some(Redirect::to("/login").into_response());
     };
     let origin_is_valid = match headers
@@ -107,29 +116,56 @@ pub(super) fn require_csrf(
     None
 }
 
-pub(super) fn login_is_throttled(state: &AdminState, peer_ip: IpAddr) -> bool {
-    let mut failed_logins = state.failed_logins.lock().unwrap();
-    let cutoff = state.clock.now() - 5 * 60;
-    failed_logins.retain(|_, attempts| {
+const LOGIN_WINDOW_SECONDS: i64 = 5 * 60;
+const LOGIN_ATTEMPTS_PER_WINDOW: usize = 5;
+const TRACKED_LOGIN_ADDRESSES: usize = 65_536;
+
+pub(super) enum LoginAttempt {
+    Throttled,
+    /// `first` is true for the first attempt from this address in the
+    /// window, so a flood records one security event, not thousands.
+    Allowed {
+        first: bool,
+    },
+}
+
+/// Reserves a login attempt for `peer_ip` (IPv6 by /64) before the password
+/// is checked, so parallel guesses cannot all pass the limit at once. A
+/// successful login releases the address with `clear_login_attempts`.
+pub(super) fn begin_login_attempt(state: &AdminState, peer_ip: IpAddr) -> LoginAttempt {
+    let key = crate::server::address_key(peer_ip);
+    let now = state.clock.now();
+    let cutoff = now - LOGIN_WINDOW_SECONDS;
+    let mut attempts_by_address = state.failed_logins.lock().unwrap();
+    attempts_by_address.retain(|_, attempts| {
         while attempts.front().is_some_and(|attempt| *attempt < cutoff) {
             attempts.pop_front();
         }
         !attempts.is_empty()
     });
-    failed_logins
-        .get(&peer_ip)
-        .is_some_and(|attempts| attempts.len() >= 5)
+    // Bound memory against address rotation; the per-address limit still
+    // applies to everything tracked.
+    if attempts_by_address.len() >= TRACKED_LOGIN_ADDRESSES
+        && !attempts_by_address.contains_key(&key)
+    {
+        attempts_by_address.clear();
+    }
+    let attempts = attempts_by_address.entry(key).or_default();
+    if attempts.len() >= LOGIN_ATTEMPTS_PER_WINDOW {
+        return LoginAttempt::Throttled;
+    }
+    attempts.push_back(now);
+    LoginAttempt::Allowed {
+        first: attempts.len() == 1,
+    }
 }
 
-pub(super) fn record_login_failure(state: &AdminState, peer_ip: IpAddr) {
-    let now = state.clock.now();
+pub(super) fn clear_login_attempts(state: &AdminState, peer_ip: IpAddr) {
     state
         .failed_logins
         .lock()
         .unwrap()
-        .entry(peer_ip)
-        .or_default()
-        .push_back(now);
+        .remove(&crate::server::address_key(peer_ip));
 }
 
 pub(super) fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -145,17 +181,25 @@ pub(super) fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> 
 // SameSite=Lax (not Strict): the OAuth callback arrives as a cross-site
 // top-level navigation from Cloudflare, and Strict would withhold the session
 // cookie there. Mutating routes remain POST + CSRF-token protected.
-pub(super) fn session_redirect(session: &str, secure: bool, location: &'static str) -> Response {
-    let secure = if secure { "; Secure" } else { "" };
+pub(super) fn session_redirect(
+    state: &AdminState,
+    session: &str,
+    location: &'static str,
+) -> Response {
     let mut response = Redirect::to(location).into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&format!(
-            "hostknot_session={session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200{secure}"
-        ))
-        .expect("valid session cookie"),
-    );
     response
+        .headers_mut()
+        .insert(header::SET_COOKIE, session_cookie(state, session, 43_200));
+    response
+}
+
+pub(super) fn session_cookie(state: &AdminState, value: &str, max_age: u32) -> HeaderValue {
+    let secure = if state.secure_cookies { "; Secure" } else { "" };
+    HeaderValue::from_str(&format!(
+        "{}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}",
+        state.session_cookie
+    ))
+    .expect("valid session cookie")
 }
 
 pub(super) async fn security_headers(request: Request, next: Next) -> Response {

@@ -9,6 +9,7 @@ mod model;
 pub mod operations;
 mod provider;
 mod proxy;
+mod server;
 mod store;
 
 use std::{
@@ -174,20 +175,18 @@ impl HostKnot {
         let http_router = proxy::http_router(proxy_state.clone());
         let https_router = proxy::https_router(proxy_state);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut http_shutdown = shutdown_rx.clone();
-        let http_task = tokio::spawn(async move {
-            if let Err(error) = axum::serve(
-                http_listener,
-                http_router.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
-                let _ = http_shutdown.changed().await;
-            })
-            .await
-            {
-                tracing::error!(%error, "HTTP listener stopped");
-            }
-        });
+        let proxy_limiter = server::ConnectionLimiter::new(
+            server::ConnectionLimits::PROXY,
+            proxy::is_cloudflare_ip,
+        );
+        let http_task = tokio::spawn(server::serve(
+            http_listener,
+            http_router,
+            None,
+            proxy_limiter.clone(),
+            server::HEADER_READ_TIMEOUT,
+            shutdown_rx.clone(),
+        ));
         let admin_ip = if config.admin_tls {
             let admin_ip = config
                 .public_ips
@@ -213,33 +212,20 @@ impl HostKnot {
         } else {
             None
         };
-        let admin_task = if config.admin_tls {
-            tokio::spawn(serve_tls(
-                listener,
-                router,
-                certificates.clone(),
-                shutdown_rx.clone(),
-            ))
-        } else {
-            let mut admin_shutdown = shutdown_rx.clone();
-            tokio::spawn(async move {
-                if let Err(error) = axum::serve(
-                    listener,
-                    router.into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .with_graceful_shutdown(async move {
-                    let _ = admin_shutdown.changed().await;
-                })
-                .await
-                {
-                    tracing::error!(%error, "administration listener stopped");
-                }
-            })
-        };
-        let tls_task = tokio::spawn(serve_tls(
+        let admin_task = tokio::spawn(server::serve(
+            listener,
+            router,
+            config.admin_tls.then(|| tls_acceptor(certificates.clone())),
+            server::ConnectionLimiter::new(server::ConnectionLimits::ADMIN, |_| false),
+            server::HEADER_READ_TIMEOUT,
+            shutdown_rx.clone(),
+        ));
+        let tls_task = tokio::spawn(server::serve(
             https_listener,
             https_router,
-            certificates.clone(),
+            Some(tls_acceptor(certificates.clone())),
+            proxy_limiter,
+            server::HEADER_READ_TIMEOUT,
             shutdown_rx,
         ));
         let renewal_certificates = certificates.clone();
@@ -317,7 +303,7 @@ impl HostKnot {
     /// stored only as hashes, so an unconfigured install gets a freshly issued
     /// token (replacing any earlier one) rather than a recovered copy.
     pub fn admin_access(state_dir: impl AsRef<Path>) -> Result<AdminAccess> {
-        let store = Store::open(state_dir.as_ref())?;
+        let store = Store::open_existing(state_dir.as_ref())?;
         Ok(match store.issue_bootstrap_if_unconfigured()? {
             Some(token) => AdminAccess::Setup { token },
             None => AdminAccess::SignIn,
@@ -325,7 +311,7 @@ impl HostKnot {
     }
 
     pub fn reset_admin(state_dir: impl AsRef<Path>) -> Result<String> {
-        let store = Store::open(state_dir.as_ref())?;
+        let store = Store::open_existing(state_dir.as_ref())?;
         store.reset_administrator()?;
         store
             .issue_bootstrap_if_unconfigured()?
@@ -388,64 +374,10 @@ impl RunningHostKnot {
     }
 }
 
-async fn serve_tls(
-    listener: TcpListener,
-    router: axum::Router,
-    certificates: Arc<CertificateResolver>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    use axum::extract::Extension;
-    use hyper_util::{
-        rt::{TokioExecutor, TokioIo},
-        server::conn::auto::Builder,
-        service::TowerToHyperService,
-    };
-    use rustls::ServerConfig;
-    use tokio_rustls::TlsAcceptor;
-
-    let mut tls_config = ServerConfig::builder()
+fn tls_acceptor(certificates: Arc<CertificateResolver>) -> tokio_rustls::TlsAcceptor {
+    let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(certificates);
     tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
-    loop {
-        tokio::select! {
-            _ = shutdown.changed() => break,
-            accepted = listener.accept() => {
-                let (socket, peer) = match accepted {
-                    Ok(accepted) => accepted,
-                    Err(error) => {
-                        // Persistent accept errors (EMFILE under fd
-                        // exhaustion) must not busy-spin the loop.
-                        tracing::warn!(%error, "TLS listener accept failed");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        continue;
-                    }
-                };
-                let acceptor = acceptor.clone();
-                let service = router.clone().layer(Extension(peer));
-                tokio::spawn(async move {
-                    // Bound the handshake so a client that never sends a
-                    // ClientHello cannot pin a task and an fd forever.
-                    let Ok(Ok(stream)) = tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        acceptor.accept(socket),
-                    )
-                    .await
-                    else {
-                        return;
-                    };
-                    let io = TokioIo::new(stream);
-                    let service = TowerToHyperService::new(service);
-                    let builder = Builder::new(TokioExecutor::new());
-                    if let Err(error) = builder
-                        .serve_connection_with_upgrades(io, service)
-                        .await
-                    {
-                        tracing::debug!(%error, "TLS connection ended");
-                    }
-                });
-            }
-        }
-    }
+    tokio_rustls::TlsAcceptor::from(Arc::new(tls_config))
 }

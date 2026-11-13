@@ -102,16 +102,27 @@ async fn binding_submission_starts_cloudflare_authorization_when_tokens_are_miss
         .await
         .unwrap();
     assert_eq!(start.status(), StatusCode::OK);
-    assert!(
-        start
-            .text()
-            .await
-            .unwrap()
-            .contains("url=/providers/cloudflare/connect")
-    );
+    let start_page = start.text().await.unwrap();
+    let connect_path = start_page
+        .split("url=")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("start page redirects to the connect URL")
+        .to_owned();
+    assert!(connect_path.starts_with("/providers/cloudflare/connect?csrf="));
+
+    // Without the session's CSRF token, starting authorization is refused:
+    // a cross-site link must not be able to begin it.
+    for forged in [
+        "/providers/cloudflare/connect".to_owned(),
+        "/providers/cloudflare/connect?csrf=forged".to_owned(),
+    ] {
+        let refused = client.get(format!("{base}{forged}")).send().await.unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{forged}");
+    }
 
     let connect = client
-        .get(format!("{base}/providers/cloudflare/connect"))
+        .get(format!("{base}{connect_path}"))
         .send()
         .await
         .unwrap();
@@ -282,7 +293,7 @@ async fn cloudflare_oauth_uses_pkce_and_rejects_callback_replay() {
     assert!(!configured_page.contains("Paste the generated credentials"));
 
     let cancelled_connect = client
-        .get(format!("{base}/providers/cloudflare/connect"))
+        .get(format!("{base}/providers/cloudflare/connect?csrf={csrf}"))
         .send()
         .await
         .unwrap();
@@ -309,7 +320,7 @@ async fn cloudflare_oauth_uses_pkce_and_rejects_callback_replay() {
     assert_eq!(cancelled_replay.status(), StatusCode::BAD_REQUEST);
 
     let connect = client
-        .get(format!("{base}/providers/cloudflare/connect"))
+        .get(format!("{base}/providers/cloudflare/connect?csrf={csrf}"))
         .send()
         .await
         .unwrap();
@@ -412,4 +423,164 @@ fn hidden_value(html: &str, name: &str) -> String {
     let marker = format!("name=\"{name}\" value=\"");
     let remainder = html.split_once(&marker).expect("hidden input").1;
     remainder.split_once('"').unwrap().0.to_owned()
+}
+
+#[tokio::test]
+async fn reconnecting_requires_an_account_that_can_reach_existing_bindings() {
+    // Two Cloudflare accounts: A owns example.com (zone-a), B does not.
+    let fake_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake = Router::new()
+        .route(
+            "/oauth2/token",
+            post(|Form(form): Form<HashMap<String, String>>| async move {
+                let account = if form.get("code").map(String::as_str) == Some("account-b") {
+                    "b"
+                } else {
+                    "a"
+                };
+                Json(json!({
+                    "access_token": format!("token-{account}"),
+                    "refresh_token": format!("refresh-{account}"),
+                    "expires_in": 3600,
+                    "token_type": "bearer",
+                    "scope": "zone.read dns.write offline_access"
+                }))
+            }),
+        )
+        .route(
+            "/client/v4/zones",
+            get(|headers: axum::http::HeaderMap| async move {
+                let zone = if headers["authorization"] == "Bearer token-b" {
+                    json!({"id": "zone-b", "name": "other.example.net"})
+                } else {
+                    json!({"id": "zone-a", "name": "example.com"})
+                };
+                Json(json!({"success": true, "errors": [], "result": [zone]}))
+            }),
+        )
+        .route(
+            "/client/v4/zones/{zone}/dns_records",
+            get(|| async { Json(json!({"success": true, "errors": [], "result": []})) }).post(
+                |Json(record): Json<serde_json::Value>| async move {
+                    Json(json!({"success": true, "errors": [], "result": {
+                        "id": "record-1", "type": record["type"], "name": record["name"],
+                        "content": record["content"], "proxied": record["proxied"],
+                        "ttl": 1, "comment": record["comment"]
+                    }}))
+                },
+            ),
+        );
+    let fake_task = tokio::spawn(async move {
+        axum::serve(fake_listener, fake).await.unwrap();
+    });
+
+    let state = TempDir::new().unwrap();
+    let config = Config::for_test(
+        state.path(),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+    )
+    .with_cloudflare_endpoints(CloudflareEndpoints {
+        authorization: Url::parse(&format!("http://{fake_addr}/oauth2/auth")).unwrap(),
+        token: Url::parse(&format!("http://{fake_addr}/oauth2/token")).unwrap(),
+        api: Url::parse(&format!("http://{fake_addr}/client/v4/")).unwrap(),
+    });
+    let running = HostKnot::start(config).await.unwrap();
+    let base = format!("http://{}", running.admin_addr());
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    client
+        .post(format!("{base}/setup"))
+        .form(&[
+            ("token", running.bootstrap_token().unwrap().as_str()),
+            ("password", "correct horse battery staple"),
+            ("acme_email", "operator@example.com"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let csrf = hidden_value(
+        &client
+            .get(format!("{base}/providers/cloudflare"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "csrf",
+    );
+    let configure = || {
+        client
+            .post(format!("{base}/providers/cloudflare/configure"))
+            .form(&[
+                ("csrf", csrf.as_str()),
+                ("client_id", "client"),
+                ("client_secret", "secret"),
+                ("scopes", "zone.read dns.write offline_access"),
+            ])
+            .send()
+    };
+    let authorize = |code: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        let csrf = csrf.clone();
+        async move {
+            let connect = client
+                .get(format!("{base}/providers/cloudflare/connect?csrf={csrf}"))
+                .send()
+                .await
+                .unwrap();
+            let authorization =
+                Url::parse(connect.headers()["location"].to_str().unwrap()).unwrap();
+            let query: HashMap<_, _> = authorization.query_pairs().into_owned().collect();
+            client
+                .get(format!(
+                    "{base}/oauth/cloudflare/callback?code={code}&state={}",
+                    query["state"]
+                ))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    configure().await.unwrap();
+    assert_eq!(authorize("account-a").await, StatusCode::SEE_OTHER);
+    let binding = client
+        .post(format!("{base}/bindings"))
+        .form(&[
+            ("csrf", csrf.as_str()),
+            ("hostname", "app.example.com"),
+            ("upstream_scheme", "http"),
+            ("upstream_port", "8080"),
+            ("replace_existing", "false"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(binding.status(), StatusCode::SEE_OTHER);
+
+    // Re-saving the client clears the tokens; account B cannot reach the
+    // binding's zone, so connecting it is refused and nothing is stored.
+    configure().await.unwrap();
+    assert_eq!(authorize("account-b").await, StatusCode::BAD_REQUEST);
+    let provider_page = client
+        .get(format!("{base}/providers/cloudflare"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!provider_page.contains("Connected"));
+    // The original account still works (secret rotation stays possible).
+    assert_eq!(authorize("account-a").await, StatusCode::SEE_OTHER);
+
+    running.shutdown().await;
+    fake_task.abort();
 }

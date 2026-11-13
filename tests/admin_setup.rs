@@ -556,3 +556,54 @@ async fn setup_validation_errors_keep_the_link_usable() {
     assert_eq!(retry.status(), StatusCode::SEE_OTHER);
     running.shutdown().await;
 }
+
+#[tokio::test]
+async fn parallel_login_guesses_cannot_exceed_the_throttle() {
+    let state = TempDir::new().unwrap();
+    let running = HostKnot::start(Config::for_test(
+        state.path(),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+    ))
+    .await
+    .unwrap();
+    let base = format!("http://{}", running.admin_addr());
+    let client = Client::builder().redirect(Policy::none()).build().unwrap();
+    client
+        .post(format!("{base}/setup"))
+        .form(&[
+            ("token", running.bootstrap_token().unwrap().as_str()),
+            ("password", "correct horse battery staple"),
+            ("acme_email", "operator@example.com"),
+        ])
+        .send()
+        .await
+        .unwrap();
+
+    // Each guess reserves its slot before the (slow) password check, so a
+    // burst cannot slip extra guesses past the limit.
+    let guesses = (0..12).map(|index| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            client
+                .post(format!("{base}/login"))
+                .form(&[("password", format!("wrong guess {index}"))])
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    let statuses = futures_util::future::join_all(guesses).await;
+    let checked = statuses
+        .iter()
+        .filter(|status| **status == StatusCode::UNAUTHORIZED)
+        .count();
+    let throttled = statuses
+        .iter()
+        .filter(|status| **status == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert_eq!(checked, 5, "{statuses:?}");
+    assert_eq!(throttled, 7, "{statuses:?}");
+    running.shutdown().await;
+}
