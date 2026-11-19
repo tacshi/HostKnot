@@ -21,6 +21,17 @@ jobs:
       - run: cargo test --all-targets
       - run: cargo build --release
 
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   cross-build:
     # Catch cross-target breaks on PRs instead of at release-tag time.
     strategy:

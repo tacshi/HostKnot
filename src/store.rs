@@ -251,7 +251,36 @@ impl Store {
         let session = random_token();
         let csrf = random_token();
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Re-verify the bootstrap token inside the write transaction so a
+        // concurrent `admin reset` or `admin url` while Argon2 was running
+        // cannot be bypassed by the stale token.
+        let expected: Option<String> = transaction
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'bootstrap_token_hash'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let issued_at: Option<String> = transaction
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'bootstrap_token_issued_at'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let expired = issued_at
+            .and_then(|value| value.parse::<i64>().ok())
+            .is_none_or(|issued_at| self.now() > issued_at + Self::BOOTSTRAP_TOKEN_TTL);
+        let supplied = hex::encode(token_hash(token));
+        let token_still_valid = !expired
+            && expected
+                .as_deref()
+                .is_some_and(|expected| bool::from(expected.as_bytes().ct_eq(supplied.as_bytes())));
+        if !token_still_valid {
+            bail!("invalid or already-used bootstrap token");
+        }
         transaction.execute(
             "INSERT INTO administrator(singleton, password_hash, created_at) VALUES(1, ?1, ?2)",
             params![password_hash, self.now()],

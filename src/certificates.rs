@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     fmt,
-    io::{BufReader, Cursor},
     net::IpAddr,
     path::PathBuf,
     sync::{Arc, RwLock},
@@ -15,7 +14,7 @@ use instant_acme::{
 use rand::Rng;
 use rcgen::generate_simple_self_signed;
 use rustls::{
-    pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject},
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
@@ -505,14 +504,14 @@ fn self_signed(names: &[&str]) -> Result<Arc<CertifiedKey>> {
 }
 
 fn certified_key(certificate_pem: &str, private_key_pem: &str) -> Result<Arc<CertifiedKey>> {
-    let mut certificates = BufReader::new(Cursor::new(certificate_pem.as_bytes()));
-    let certificates = rustls_pemfile::certs(&mut certificates)
-        .collect::<std::io::Result<Vec<_>>>()
+    let certificates = CertificateDer::pem_slice_iter(certificate_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
         .context("parse certificate chain")?;
-    let mut private_key = BufReader::new(Cursor::new(private_key_pem.as_bytes()));
-    let private_key = rustls_pemfile::private_key(&mut private_key)
-        .context("parse certificate private key")?
-        .context("certificate private key is missing")?;
+    if certificates.is_empty() {
+        anyhow::bail!("certificate chain is empty");
+    }
+    let private_key = PrivateKeyDer::from_pem_slice(private_key_pem.as_bytes())
+        .context("parse certificate private key")?;
     let provider =
         rustls::crypto::CryptoProvider::get_default().context("install rustls crypto provider")?;
     let signing_key = provider
@@ -529,8 +528,7 @@ fn install_crypto_provider() {
 fn certificate_validity(
     certificate_pem: &str,
 ) -> Result<(i64, i64, rustls::pki_types::CertificateDer<'static>)> {
-    let mut reader = BufReader::new(Cursor::new(certificate_pem.as_bytes()));
-    let first = rustls_pemfile::certs(&mut reader)
+    let first = CertificateDer::pem_slice_iter(certificate_pem.as_bytes())
         .next()
         .transpose()
         .context("parse issued certificate")?

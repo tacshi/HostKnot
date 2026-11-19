@@ -53,6 +53,8 @@ impl Cloudflare {
             endpoints,
             client: Client::builder()
                 .user_agent(concat!("hostknot/", env!("CARGO_PKG_VERSION")))
+                .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             callback_url,
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
