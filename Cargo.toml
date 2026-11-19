@@ -27,7 +27,7 @@ instant-acme = { version = "0.8", features = ["time", "x509-parser"] }
 rand = "0.9"
 rcgen = { version = "0.14", features = ["aws_lc_rs", "pem", "x509-parser"] }
 reqwest = { version = "0.12", default-features = false, features = ["cookies", "http2", "json", "rustls-tls", "stream"] }
-rusqlite = { version = "0.43", features = ["bundled", "chrono", "uuid"] }
+rusqlite = { version = "0.43", features = ["bundled", "uuid"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 secrecy = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
