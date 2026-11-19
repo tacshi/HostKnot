@@ -79,11 +79,11 @@ pub(super) fn require_csrf(
             .is_none_or(|site| matches!(site, "same-origin" | "none")),
         Some(origin) if origin == state.expected_origin => true,
         // A browser pins Origin to the source page, so matching it to the
-        // request Host remains valid even when the operator used a different
-        // local address than the configured public URL.
+        // request Host (with the expected scheme) remains valid even when the
+        // operator used a different local address than the configured public URL.
         Some(origin)
-            if origin_host(origin).is_some()
-                && origin_host(origin)
+            if origin_host(origin, state.secure_cookies).is_some()
+                && origin_host(origin, state.secure_cookies)
                     == headers
                         .get(header::HOST)
                         .and_then(|value| value.to_str().ok())
@@ -143,12 +143,16 @@ pub(super) fn begin_login_attempt(state: &AdminState, peer_ip: IpAddr) -> LoginA
         }
         !attempts.is_empty()
     });
-    // Bound memory against address rotation; the per-address limit still
-    // applies to everything tracked.
+    // Bound memory against address rotation without wiping active throttles
+    // for every other address: evict the stalest tracked entry instead.
     if attempts_by_address.len() >= TRACKED_LOGIN_ADDRESSES
         && !attempts_by_address.contains_key(&key)
+        && let Some(oldest) = attempts_by_address
+            .iter()
+            .min_by_key(|(_, attempts)| attempts.back().copied().unwrap_or(i64::MIN))
+            .map(|(address, _)| *address)
     {
-        attempts_by_address.clear();
+        attempts_by_address.remove(&oldest);
     }
     let attempts = attempts_by_address.entry(key).or_default();
     if attempts.len() >= LOGIN_ATTEMPTS_PER_WINDOW {
@@ -229,9 +233,7 @@ pub(super) async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-fn origin_host(origin: &str) -> Option<String> {
-    origin
-        .strip_prefix("https://")
-        .or_else(|| origin.strip_prefix("http://"))
-        .map(str::to_ascii_lowercase)
+fn origin_host(origin: &str, secure: bool) -> Option<String> {
+    let prefix = if secure { "https://" } else { "http://" };
+    origin.strip_prefix(prefix).map(str::to_ascii_lowercase)
 }

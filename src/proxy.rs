@@ -1,6 +1,7 @@
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
@@ -61,11 +62,15 @@ pub struct ProxyState {
     certificates: Arc<CertificateResolver>,
 }
 
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const UPSTREAM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl ProxyState {
     pub fn new(store: Store, certificates: Arc<CertificateResolver>) -> Self {
         let loopback_connector = || {
             let mut connector = HttpConnector::new_with_resolver(LoopbackResolver);
             connector.enforce_http(false);
+            connector.set_connect_timeout(Some(UPSTREAM_CONNECT_TIMEOUT));
             connector
         };
         let verified = HttpsConnectorBuilder::new()
@@ -207,7 +212,12 @@ async fn proxy_entry(
     } else {
         &state.client
     };
-    match client.request(request).await {
+    let upstream_result =
+        match tokio::time::timeout(UPSTREAM_RESPONSE_TIMEOUT, client.request(request)).await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(_) => Err("upstream response timed out".to_owned()),
+        };
+    match upstream_result {
         Ok(mut response) => {
             // Persist health only on transitions — a WAL commit per proxied
             // request would serialize all traffic on the store mutex.
@@ -409,6 +419,13 @@ const CLOUDFLARE_RANGES: &[&str] = &[
 ];
 
 pub(crate) fn is_cloudflare_ip(ip: IpAddr) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        other => other,
+    };
     CLOUDFLARE_RANGES.iter().any(|range| {
         let Some((network, prefix)) = range.split_once('/') else {
             return false;
@@ -506,12 +523,14 @@ mod tests {
 
     #[test]
     fn cloudflare_ranges_match_edges_and_reject_others() {
-        // Addresses inside published Cloudflare ranges (v4 and v6).
+        // Addresses inside published Cloudflare ranges (v4, v6, and IPv4-mapped IPv6).
         assert!(is_cloudflare_ip("104.23.198.120".parse().unwrap()));
+        assert!(is_cloudflare_ip("::ffff:104.23.198.120".parse().unwrap()));
         assert!(is_cloudflare_ip("172.71.0.1".parse().unwrap()));
         assert!(is_cloudflare_ip("2606:4700::1".parse().unwrap()));
         // Loopback, RFC1918, documentation, and arbitrary public space.
         assert!(!is_cloudflare_ip("127.0.0.1".parse().unwrap()));
+        assert!(!is_cloudflare_ip("::ffff:127.0.0.1".parse().unwrap()));
         assert!(!is_cloudflare_ip("192.168.1.10".parse().unwrap()));
         assert!(!is_cloudflare_ip("203.0.113.7".parse().unwrap()));
         assert!(!is_cloudflare_ip("2001:db8::1".parse().unwrap()));

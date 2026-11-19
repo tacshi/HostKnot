@@ -187,7 +187,7 @@ pub async fn doctor(config_path: &Path, offline: bool) -> Result<DoctorReport> {
             "configuration has no public IP addresses".to_owned(),
         );
     }
-    let local_addresses: Vec<IpAddr> = get_if_addrs::get_if_addrs()
+    let local_addresses: Vec<IpAddr> = if_addrs::get_if_addrs()
         .map(|interfaces| {
             interfaces
                 .into_iter()

@@ -43,10 +43,15 @@ pub struct AdminState {
     bindings: BindingManager,
     expected_origin: String,
     failed_logins: Mutex<HashMap<IpAddr, VecDeque<i64>>>,
+    /// Caps concurrent Argon2 password verifications so distributed login
+    /// floods cannot exhaust RAM on a small VPS.
+    login_semaphore: Arc<tokio::sync::Semaphore>,
     session_cookie: &'static str,
     certificates: Arc<CertificateResolver>,
     clock: crate::Clock,
 }
+
+const MAX_CONCURRENT_LOGINS: usize = 4;
 
 impl AdminState {
     pub fn new(
@@ -68,6 +73,7 @@ impl AdminState {
             bindings,
             expected_origin,
             failed_logins: Mutex::new(HashMap::new()),
+            login_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LOGINS)),
             session_cookie: session_cookie_name(secure_cookies),
             certificates,
             clock,
@@ -305,8 +311,11 @@ async fn login(
         }
         LoginAttempt::Allowed { first } => first,
     };
-    // Argon2 verification is deliberately slow; keep it off the async
-    // workers that also serve proxy traffic.
+    // Argon2 verification is deliberately slow and memory-hard; keep it off
+    // the async workers and bound concurrency so a flood cannot exhaust RAM.
+    let Ok(_permit) = state.login_semaphore.acquire().await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let store = state.store.clone();
     let password = form.password;
     let verified = tokio::task::spawn_blocking(move || store.verify_password(&password))
